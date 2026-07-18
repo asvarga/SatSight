@@ -11,7 +11,13 @@
 //! *pure logic* (unit propagation + failed-literal probing) and reports the
 //! forced placements and proven eliminations in the puzzle's own language — no
 //! search, and generic over every [`Puzzle`].
+//!
+//! [`sudoku`] is the primary puzzle; [`coloring`] (graph coloring) is the second,
+//! present to prove the abstraction is not Sudoku-shaped: it crosses the same
+//! bridge with a genuinely different constraint (edge-difference clauses), with no
+//! changes to `satsight-core`.
 
+pub mod coloring;
 pub mod puzzle;
 pub mod sudoku;
 

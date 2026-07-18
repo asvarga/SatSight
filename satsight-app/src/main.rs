@@ -11,7 +11,10 @@
 //! - **Step** drives the observable hand-written CDCL one [`Event`] at a time
 //!   (plan §6): watch it guess, propagate forced cells, hit conflicts, learn, and
 //!   backtrack, with live corner-mark candidates — the bidirectional thesis in
-//!   motion. A speed slider runs N steps/frame.
+//!   motion. Placements and eliminations forced by the givens alone (proven) are
+//!   drawn solid; those contingent on a search guess (hypothetical) are drawn
+//!   faded and struck, so known facts read apart from tentative ones (plan §1). A
+//!   speed slider runs N steps/frame.
 //!
 //! Edits are cheap because givens are assumptions, not clauses (plan §4): changing
 //! a clue just rebuilds the assumption vector and drops cached results.
@@ -31,7 +34,7 @@ use satsight_core::{BatSatBackend, Cdcl, Cnf, Registry, SolveOutcome, Solver};
 use satsight_puzzles::sudoku::{Cell, LogicReport, Sudoku, SudokuCell};
 use satsight_puzzles::{deduce, Grid, Puzzle};
 
-use stepper::{Emphasis, Stepper};
+use stepper::{Certainty, Emphasis, Stepper};
 
 /// The tint on a center mark caught in a learned relationship (plan §8).
 const LEARNED_MARK_COLOR: egui::Color32 = egui::Color32::from_rgb(210, 150, 90);
@@ -103,8 +106,12 @@ enum Source {
     Given,
     Logic,
     Full,
-    /// Placed by the stepped search (tentative mid-search value).
-    Search,
+    /// Placed by the stepped search and entailed by the givens alone — a proven
+    /// fact (plan §1), drawn solid.
+    SearchProven,
+    /// Placed by the stepped search but contingent on a branching guess — a
+    /// hypothetical fact, drawn faded so it reads as tentative.
+    SearchGuess,
 }
 
 /// The application state. Rules are encoded once (they never change); solver
@@ -292,11 +299,18 @@ impl App {
                 .as_ref()
                 .and_then(|g| g.get(r, c).value)
                 .map(|v| (v, Source::Full)),
-            Overlay::Step => self
-                .stepper
-                .as_ref()
-                .and_then(|st| st.placed(r, c))
-                .map(|v| (v, Source::Search)),
+            Overlay::Step => {
+                self.stepper
+                    .as_ref()
+                    .and_then(|st| st.placement(r, c))
+                    .map(|(v, certainty)| {
+                        let source = match certainty {
+                            Certainty::Proven => Source::SearchProven,
+                            Certainty::Hypothetical => Source::SearchGuess,
+                        };
+                        (v, source)
+                    })
+            }
         }
     }
 
@@ -348,6 +362,9 @@ impl App {
         let full_color = visuals.weak_text_color();
         let logic_color = egui::Color32::from_rgb(80, 160, 255);
         let search_color = egui::Color32::from_rgb(120, 200, 120);
+        // A guess-contingent placement is the same hue, faded, so proven vs
+        // hypothetical reads at a glance like pen vs pencil (plan §1).
+        let guess_color = search_color.gamma_multiply(0.5);
         let candidate_color = visuals.weak_text_color().gamma_multiply(0.75);
         let sel_color = visuals.selection.bg_fill;
         let core_color = egui::Color32::from_rgb(200, 70, 70).gamma_multiply(0.30);
@@ -401,7 +418,8 @@ impl App {
                         Source::Given => given_color,
                         Source::Logic => logic_color,
                         Source::Full => full_color,
-                        Source::Search => search_color,
+                        Source::SearchProven => search_color,
+                        Source::SearchGuess => guess_color,
                     };
                     painter.text(
                         cell_rect(r, c).center(),
@@ -424,9 +442,11 @@ impl App {
                                 candidates: st.candidates(r, c),
                                 learned: st.learned_marks(r, c),
                                 corner: st.corner_marks(r, c),
+                                guess_eliminated: st.hypo_eliminated(r, c),
                                 color: candidate_color,
                                 learned_color: LEARNED_MARK_COLOR,
                                 corner_color: CORNER_MARK_COLOR,
+                                guess_color,
                             },
                         );
                     }
@@ -502,10 +522,12 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 color_key(ui, egui::Color32::from_rgb(80, 160, 255), "logic-proven");
-                color_key(ui, egui::Color32::from_rgb(120, 200, 120), "search-placed");
+                let search = egui::Color32::from_rgb(120, 200, 120);
+                color_key(ui, search, "search-proven");
                 color_key(ui, ui.visuals().weak_text_color(), "full-solve");
                 color_key(ui, ui.visuals().strong_text_color(), "given");
                 if self.overlay == Overlay::Step {
+                    color_key(ui, search.gamma_multiply(0.5), "guess (hypothetical)");
                     color_key(ui, CORNER_MARK_COLOR, "corner mark (box-confined)");
                     color_key(ui, LEARNED_MARK_COLOR, "learned relationship");
                 }
@@ -593,9 +615,13 @@ struct CandidateMarks {
     learned: [bool; 9],
     /// Values propagation has confined to a few cells of the box (corner marks).
     corner: [bool; 9],
+    /// Values the current guess rules out here — hypothetical eliminations, shown
+    /// struck through so a contingent elimination reads apart from a proven one.
+    guess_eliminated: [bool; 9],
     color: egui::Color32,
     learned_color: egui::Color32,
     corner_color: egui::Color32,
+    guess_color: egui::Color32,
 }
 
 /// Draw a cell's pencil marks while the search runs (Step view): the surviving
@@ -610,23 +636,46 @@ fn draw_candidates(painter: &egui::Painter, rect: egui::Rect, cell: f32, marks: 
     // to a corner mark (drawn below instead of twice).
     if marks.candidates.iter().filter(|&&b| b).count() <= 6 {
         let sub = cell / 3.0;
+        let mark_pos = |i: usize| {
+            let (sr, sc) = (i / 3, i % 3);
+            rect.min + egui::vec2((sc as f32 + 0.5) * sub, (sr as f32 + 0.5) * sub)
+        };
         for (i, &alive) in marks.candidates.iter().enumerate() {
             if !alive || marks.corner[i] {
                 continue;
             }
-            let (sr, sc) = (i / 3, i % 3);
-            let pos = rect.min + egui::vec2((sc as f32 + 0.5) * sub, (sr as f32 + 0.5) * sub);
             let digit_color = if marks.learned[i] {
                 marks.learned_color
             } else {
                 marks.color
             };
             painter.text(
-                pos,
+                mark_pos(i),
                 egui::Align2::CENTER_CENTER,
                 (i + 1).to_string(),
                 egui::FontId::proportional(sub * 0.62),
                 digit_color,
+            );
+        }
+        // Hypothetical eliminations: values the current guess (not the givens)
+        // rules out here, drawn struck through so they read as contingent — a
+        // known elimination is simply absent instead (plan §1).
+        for (i, &gone) in marks.guess_eliminated.iter().enumerate() {
+            if !gone {
+                continue;
+            }
+            let pos = mark_pos(i);
+            painter.text(
+                pos,
+                egui::Align2::CENTER_CENTER,
+                (i + 1).to_string(),
+                egui::FontId::proportional(sub * 0.62),
+                marks.guess_color,
+            );
+            let reach = sub * 0.3;
+            painter.line_segment(
+                [pos - egui::vec2(reach, 0.0), pos + egui::vec2(reach, 0.0)],
+                egui::Stroke::new(1.0, marks.guess_color),
             );
         }
     }

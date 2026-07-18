@@ -13,6 +13,9 @@
 //!   cell (plan §8's center marks: BCP survivors);
 //! - [`corner_marks`](Stepper::corner_marks) — per 3×3 box, the values BCP has
 //!   confined to a few cells ("the 7 goes in one of these cells");
+//! - [`placement`](Stepper::placement) / [`hypo_eliminated`](Stepper::hypo_eliminated)
+//!   — the same facts split by [`Certainty`]: entailed by the givens (proven) vs
+//!   contingent on a search guess (hypothetical), which the grid draws differently;
 //! - [`description`](Stepper::description) / [`emphasis`](Stepper::emphasis) — the
 //!   last event, decoded to a human sentence and to the cells to highlight;
 //! - [`core_cells`](Stepper::core_cells) — on UNSAT, the conflicting givens to
@@ -117,6 +120,42 @@ impl Stepper {
         (1..=9u8).find(|&v| self.value(r, c, v) == Some(true))
     }
 
+    /// The digit forced in `(r, c)` together with whether that placement is a
+    /// **proven** fact (entailed by the givens alone via propagation) or a
+    /// **hypothetical** one (contingent on a branching guess, undone on
+    /// backtrack) — the split the grid colours differently (plan §1).
+    #[must_use]
+    pub fn placement(&self, r: usize, c: usize) -> Option<(u8, Certainty)> {
+        let v = self.placed(r, c)?;
+        Some((v, self.certainty(r, c, v)))
+    }
+
+    /// Values ruled out in `(r, c)` *only* under the current guess — hypothetical
+    /// eliminations, falsified above the givens' base level. Entry `v - 1` is
+    /// `true` for such a value. Proven eliminations (forced by the givens) are
+    /// omitted: they are known non-facts, so the grid simply leaves them unmarked.
+    #[must_use]
+    pub fn hypo_eliminated(&self, r: usize, c: usize) -> [bool; 9] {
+        let base = self.search.base_level();
+        std::array::from_fn(|i| {
+            let v = u8::try_from(i + 1).expect("1..=9 fits in u8");
+            matches!(self.assigned(r, c, v), Some((false, level)) if level > base)
+        })
+    }
+
+    /// Whether the current assignment of `Cell { r, c, v }` is proven (set at or
+    /// below the givens' base level) or hypothetical (set above it).
+    fn certainty(&self, r: usize, c: usize, v: u8) -> Certainty {
+        let proven = self
+            .assigned(r, c, v)
+            .is_some_and(|(_, level)| level <= self.search.base_level());
+        if proven {
+            Certainty::Proven
+        } else {
+            Certainty::Hypothetical
+        }
+    }
+
     /// Per-value center-mark candidates for `(r, c)`: entry `v - 1` is `true` when
     /// value `v` is still Boolean-possible (not yet falsified).
     #[must_use]
@@ -146,6 +185,13 @@ impl Stepper {
         self.reg
             .get(&Cell { r, c, v })
             .and_then(|var| self.search.value_of(var))
+    }
+
+    /// The truth value of `Cell { r, c, v }` and the decision level it was set
+    /// at, if assigned — the raw material for the proven/hypothetical split.
+    fn assigned(&self, r: usize, c: usize, v: u8) -> Option<(bool, u32)> {
+        let var = self.reg.get(&Cell { r, c, v })?;
+        Some((self.search.value_of(var)?, self.search.level_of(var)?))
     }
 
     /// The last event, decoded into a one-line status for the UI.
@@ -294,7 +340,7 @@ fn box_corner_marks(box_candidates: &[[bool; 9]; 9]) -> [[bool; 9]; 9] {
 
 #[cfg(test)]
 mod tests {
-    use super::Stepper;
+    use super::{Certainty, Stepper};
     use satsight_core::{Cdcl, Cnf, Registry};
     use satsight_puzzles::sudoku::{Cell, Sudoku};
     use satsight_puzzles::Puzzle;
@@ -452,6 +498,69 @@ mod tests {
         for line in stepper.learned_relationships() {
             assert!(line.contains('r'), "a relationship names cells");
         }
+    }
+
+    #[test]
+    fn given_cells_are_proven_facts() {
+        // Givens enter the search as assumptions (base-level decisions), so they
+        // and their propagated consequences read as proven — never hypotheses —
+        // no matter how much branching the rest of the solve needs.
+        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
+        let mut stepper = stepper_for(&puzzle);
+        while !stepper.is_done() {
+            stepper.step();
+        }
+        let bytes = PUZZLE.as_bytes();
+        for r in 0..9 {
+            for c in 0..9 {
+                if bytes[r * 9 + c] != b'.' {
+                    assert_eq!(
+                        stepper.placement(r, c).map(|(_, cert)| cert),
+                        Some(Certainty::Proven),
+                        "given r{r}c{c} is a known fact"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_board_search_is_all_hypothetical() {
+        // With no givens the base level is 0, so the first cell the search fills —
+        // and its knock-on eliminations — are contingent on that guess, not proven.
+        let mut stepper = stepper_for(&Sudoku::empty());
+        let placed = loop {
+            stepper.step();
+            if let Some(cell) = (0..9)
+                .flat_map(|r| (0..9).map(move |c| (r, c)))
+                .find(|&(r, c)| stepper.placed(r, c).is_some())
+            {
+                break cell;
+            }
+            assert!(
+                !stepper.is_done(),
+                "the search fills a cell before finishing"
+            );
+        };
+        let (r, c) = placed;
+        assert_eq!(
+            stepper.placement(r, c).map(|(_, cert)| cert),
+            Some(Certainty::Hypothetical),
+            "with no givens, a placed cell is a hypothesis"
+        );
+        // The value the guess placed is ruled out (hypothetically) elsewhere in
+        // its house once propagation runs.
+        let v = stepper.placed(r, c).expect("the cell holds a value");
+        for _ in 0..40 {
+            stepper.step();
+        }
+        let ruled_out_in_house = (0..9)
+            .filter(|&cc| cc != c)
+            .any(|cc| stepper.hypo_eliminated(r, cc)[usize::from(v - 1)]);
+        assert!(
+            ruled_out_in_house,
+            "the guess contingently rules its value out along the row"
+        );
     }
 
     #[test]

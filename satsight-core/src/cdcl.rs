@@ -222,6 +222,37 @@ impl Search {
         u32::try_from(self.trail_lim.len()).expect("decision level fits in u32")
     }
 
+    /// The deepest decision level currently occupied by a given (assumption
+    /// literal), or `0` if none is placed as a decision.
+    ///
+    /// This is the boundary between the two kinds of mid-search fact (plan §1):
+    /// an assignment at or below it is entailed by the givens alone via
+    /// propagation — a **proven** fact that holds in every solution consistent
+    /// with the clues — while an assignment above it is contingent on a
+    /// branching guess and may be undone on backtrack — a **hypothetical** one.
+    /// Assumptions always occupy the lowest levels (they are placed before any
+    /// branch and re-placed first after each backtrack), so the split is a clean
+    /// threshold on [`level_of`](Search::level_of).
+    #[must_use]
+    pub fn base_level(&self) -> u32 {
+        self.is_assumption
+            .iter()
+            .enumerate()
+            .filter(|&(_, &assumed)| assumed)
+            .map(|(i, _)| self.level[i])
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The decision level at which `var` currently holds a value, or `None` if it
+    /// is unassigned. Compare against [`base_level`](Search::base_level) to tell a
+    /// proven assignment from a hypothetical one.
+    #[must_use]
+    pub fn level_of(&self, var: Var) -> Option<u32> {
+        let i = var.idx();
+        self.value.get(i).copied().flatten().map(|_| self.level[i])
+    }
+
     /// The assignment stack in the order literals were set — the tentative
     /// puzzle state mid-search (plan §1), for the trail overlay.
     #[must_use]
@@ -759,6 +790,35 @@ mod tests {
                 _ => panic!("CDCL and BatSat disagree under assumptions"),
             }
         }
+    }
+
+    #[test]
+    fn proven_and_hypothetical_split_at_the_last_assumption() {
+        // (¬a ∨ b): assuming `a` forces `b` at the assumption's level (proven),
+        // and any later branch opens a deeper, hypothetical level. `c` is a free
+        // variable to branch on once the assumption is satisfied.
+        let (a, b, c) = (Var::new(0), Var::new(1), Var::new(2));
+        let mut cnf = Cnf::new();
+        cnf.add_clause(clause([a.neg_lit(), b.pos_lit()]));
+        // A tautology that never propagates, just to register `c` as branchable.
+        cnf.add_clause(clause([c.pos_lit(), c.neg_lit()]));
+        let cdcl = Cdcl::from_cnf(&cnf);
+        let mut search: Search = cdcl.search(&[a.pos_lit()]);
+
+        // First: the assumption `a` is placed as the base decision.
+        assert!(matches!(search.step(), Event::Decide { .. }));
+        assert_eq!(search.base_level(), 1);
+        assert_eq!(search.level_of(a), Some(1));
+
+        // Then `b` is forced by propagation at the base level — a proven fact.
+        assert!(matches!(search.step(), Event::Propagate { .. }));
+        assert_eq!(search.level_of(b), Some(1));
+        assert!(search.level_of(b).unwrap() <= search.base_level());
+
+        // With the assumption satisfied, the search branches on `c` above the
+        // base level — a hypothesis.
+        assert!(matches!(search.step(), Event::Decide { .. }));
+        assert!(search.level_of(c).unwrap() > search.base_level());
     }
 
     #[test]

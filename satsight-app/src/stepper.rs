@@ -10,7 +10,9 @@
 //! - [`placed`](Stepper::placed) — the digit the search currently forces in a
 //!   cell (its tentative value mid-search);
 //! - [`candidates`](Stepper::candidates) — the values still Boolean-possible in a
-//!   cell (plan §8's corner marks: BCP survivors);
+//!   cell (plan §8's center marks: BCP survivors);
+//! - [`corner_marks`](Stepper::corner_marks) — per 3×3 box, the values BCP has
+//!   confined to a few cells ("the 7 goes in one of these cells");
 //! - [`description`](Stepper::description) / [`emphasis`](Stepper::emphasis) — the
 //!   last event, decoded to a human sentence and to the cells to highlight;
 //! - [`core_cells`](Stepper::core_cells) — on UNSAT, the conflicting givens to
@@ -27,12 +29,30 @@ pub enum Emphasis {
     Cells(Vec<(usize, usize)>),
 }
 
+/// Whether a mid-search fact is entailed by the givens alone or is contingent on
+/// a search assumption — the distinction the grid draws differently (plan §1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Certainty {
+    /// Forced by the givens (assumptions) via propagation: a **known** fact that
+    /// holds in every solution consistent with the clues.
+    Proven,
+    /// Placed or ruled out only under the current branching guess: a
+    /// **hypothetical** fact that may be undone on backtrack.
+    Hypothetical,
+}
+
 /// The most recent short learned clauses to keep for the overlay.
 const LEARNED_KEPT: usize = 16;
 
 /// The longest learned clause worth showing as a "discovered relationship"
 /// (plan §8: raw CDCL clauses are noisy; filter to short, readable ones).
 const LEARNED_MAX_LITS: usize = 3;
+
+/// A value confined by propagation to at most this many cells of a 3×3 box is
+/// surfaced as a corner mark — the footprint of a hidden pair/triple ("one of
+/// these cells"). Wider than that is no hint; a value pinned to a single cell is
+/// a hidden single, shown as a placement instead.
+const CORNER_MARK_MAX_CELLS: usize = 3;
 
 /// Drives a [`Search`] event-by-event and decodes its state for the grid.
 pub struct Stepper {
@@ -97,7 +117,7 @@ impl Stepper {
         (1..=9u8).find(|&v| self.value(r, c, v) == Some(true))
     }
 
-    /// Per-value corner-mark candidates for `(r, c)`: entry `v - 1` is `true` when
+    /// Per-value center-mark candidates for `(r, c)`: entry `v - 1` is `true` when
     /// value `v` is still Boolean-possible (not yet falsified).
     #[must_use]
     pub fn candidates(&self, r: usize, c: usize) -> [bool; 9] {
@@ -105,6 +125,20 @@ impl Stepper {
             let v = u8::try_from(i + 1).expect("1..=9 fits in u8");
             self.value(r, c, v) != Some(false)
         })
+    }
+
+    /// Per-value corner marks for `(r, c)`: entry `v - 1` is `true` when value
+    /// `v` is Boolean-confined within this cell's 3×3 box to a small set of cells
+    /// that includes this one — the "the 7 goes in one of these cells in the box"
+    /// hint (a hidden pair/triple footprint), distinct from the per-cell center
+    /// marks.
+    #[must_use]
+    pub fn corner_marks(&self, r: usize, c: usize) -> [bool; 9] {
+        let (br, bc) = (r - r % 3, c - c % 3);
+        let box_candidates: [[bool; 9]; 9] =
+            std::array::from_fn(|i| self.candidates(br + i / 3, bc + i % 3));
+        let local = (r - br) * 3 + (c - bc);
+        box_corner_marks(&box_candidates)[local]
     }
 
     /// The current truth value of proposition `Cell { r, c, v }`.
@@ -200,21 +234,21 @@ impl Stepper {
             .collect()
     }
 
-    /// Per-value center marks for `(r, c)`: entry `v - 1` is `true` when value `v`
-    /// appears in a retained learned clause touching this cell — the
-    /// discovered-relationship tier (plan §8), distinct from the corner-mark
-    /// candidates.
+    /// Per-value learned marks for `(r, c)`: entry `v - 1` is `true` when value
+    /// `v` appears in a retained learned clause touching this cell — the
+    /// discovered-relationship tier (plan §8), rendered as a tint on the cell's
+    /// center marks.
     #[must_use]
-    pub fn center_candidates(&self, r: usize, c: usize) -> [bool; 9] {
-        let mut center = [false; 9];
+    pub fn learned_marks(&self, r: usize, c: usize) -> [bool; 9] {
+        let mut marks = [false; 9];
         for rel in &self.learned {
             for (cell, _) in rel {
                 if cell.r == r && cell.c == c {
-                    center[usize::from(cell.v - 1)] = true;
+                    marks[usize::from(cell.v - 1)] = true;
                 }
             }
         }
-        center
+        marks
     }
 
     /// Decode a literal to its Sudoku cell. Every rule/learned literal is a
@@ -237,6 +271,25 @@ fn format_relationship(rel: &[(Cell, bool)]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ∨ ")
+}
+
+/// From the per-cell candidate arrays of a 3×3 box (row-major, cell `i`'s entry
+/// `v` telling whether value `v + 1` is still possible there), the corner marks
+/// per box-cell: value `v` is a corner mark wherever it's still a candidate,
+/// provided the whole box admits it in `2..=CORNER_MARK_MAX_CELLS` cells — few
+/// enough to read as "`v` goes in one of these cells." (A value admitted in a
+/// single cell is a hidden single, shown as a placement instead.)
+fn box_corner_marks(box_candidates: &[[bool; 9]; 9]) -> [[bool; 9]; 9] {
+    let mut marks = [[false; 9]; 9];
+    for v in 0..9 {
+        let count = (0..9).filter(|&i| box_candidates[i][v]).count();
+        if (2..=CORNER_MARK_MAX_CELLS).contains(&count) {
+            for (i, cell) in marks.iter_mut().enumerate() {
+                cell[v] = box_candidates[i][v];
+            }
+        }
+    }
+    marks
 }
 
 #[cfg(test)]
@@ -301,9 +354,9 @@ mod tests {
     }
 
     #[test]
-    fn learned_clauses_become_readable_relationships_and_center_marks() {
+    fn learned_clauses_become_readable_relationships_and_learned_marks() {
         // Inject a decoded learned clause (as the Learn path would) and check it
-        // reads as a disjunction and surfaces as center marks on its cells.
+        // reads as a disjunction and surfaces as learned marks on its cells.
         let mut stepper = stepper_for(&Sudoku::empty());
         stepper.learned.push(vec![
             (Cell { r: 0, c: 1, v: 3 }, false),
@@ -314,10 +367,73 @@ mod tests {
             vec!["r1c2≠3 ∨ r4c2≠3".to_string()]
         );
         // Value 3 (index 2) is flagged in both cells, and nowhere else.
-        assert!(stepper.center_candidates(0, 1)[2]);
-        assert!(stepper.center_candidates(3, 1)[2]);
-        assert!(!stepper.center_candidates(0, 0)[2]);
-        assert!(!stepper.center_candidates(0, 1)[0]);
+        assert!(stepper.learned_marks(0, 1)[2]);
+        assert!(stepper.learned_marks(3, 1)[2]);
+        assert!(!stepper.learned_marks(0, 0)[2]);
+        assert!(!stepper.learned_marks(0, 1)[0]);
+    }
+
+    #[test]
+    fn box_confinement_surfaces_as_corner_marks() {
+        // A box where value 7 (index 6) is admitted in exactly three cells is a
+        // "one of these cells" hint on those three; a value spread across the
+        // whole box, or pinned to a single cell, is not.
+        let mut cand = [[true; 9]; 9];
+        for row in cand.iter_mut().skip(3) {
+            row[6] = false; // value 7 only in box-cells 0, 1, 2
+        }
+        for (i, row) in cand.iter_mut().enumerate() {
+            row[0] = i == 4; // value 1 pinned to a single box-cell (index 4)
+        }
+        let marks = super::box_corner_marks(&cand);
+        assert!(marks[0][6] && marks[1][6] && marks[2][6]);
+        assert!(marks.iter().skip(3).all(|cell| !cell[6]));
+        // Value 1 sits in one cell (hidden single) → no corner mark anywhere.
+        assert!(marks.iter().all(|cell| !cell[0]));
+        // Value 2 (index 1) is admitted everywhere (nine cells) → not confined.
+        assert!(marks.iter().all(|cell| !cell[1]));
+    }
+
+    #[test]
+    fn corner_marks_appear_over_a_real_search() {
+        // On a real puzzle, propagation confines some value to a few cells of a
+        // box at some point during the solve — the corner-mark hint must fire on
+        // genuine solver state, not just synthetic candidate arrays.
+        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
+        let mut stepper = stepper_for(&puzzle);
+        let mut ever = false;
+        while !stepper.is_done() {
+            stepper.step();
+            ever |= (0..9)
+                .flat_map(|r| (0..9).map(move |c| (r, c)))
+                .any(|(r, c)| stepper.corner_marks(r, c).iter().any(|&m| m));
+            if ever {
+                break;
+            }
+        }
+        assert!(
+            ever,
+            "a real search should surface at least one corner mark"
+        );
+    }
+
+    #[test]
+    fn a_solved_board_leaves_no_corner_marks() {
+        // Once solved, each value sits in exactly one cell of every box, so no
+        // box confinement remains to surface.
+        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
+        let mut stepper = stepper_for(&puzzle);
+        while !stepper.is_done() {
+            stepper.step();
+        }
+        for r in 0..9 {
+            for c in 0..9 {
+                assert!(
+                    stepper.corner_marks(r, c).iter().all(|&m| !m),
+                    "a solved board leaves no box-confined corner marks at r{r}c{c}"
+                );
+            }
+        }
     }
 
     #[test]

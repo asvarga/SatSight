@@ -33,6 +33,11 @@ use satsight_puzzles::{deduce, Grid, Puzzle};
 
 use stepper::{Emphasis, Stepper};
 
+/// The tint on a center mark caught in a learned relationship (plan §8).
+const LEARNED_MARK_COLOR: egui::Color32 = egui::Color32::from_rgb(210, 150, 90);
+/// Corner marks: digits propagation has confined to a few cells of a 3×3 box.
+const CORNER_MARK_COLOR: egui::Color32 = egui::Color32::from_rgb(168, 130, 224);
+
 /// Native entry point: open a window (plan §9; wasm entry point below).
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
@@ -344,7 +349,6 @@ impl App {
         let logic_color = egui::Color32::from_rgb(80, 160, 255);
         let search_color = egui::Color32::from_rgb(120, 200, 120);
         let candidate_color = visuals.weak_text_color().gamma_multiply(0.75);
-        let center_color = egui::Color32::from_rgb(210, 150, 90);
         let sel_color = visuals.selection.bg_fill;
         let core_color = egui::Color32::from_rgb(200, 70, 70).gamma_multiply(0.30);
         let emphasis_color = egui::Color32::from_rgb(240, 190, 90);
@@ -407,17 +411,23 @@ impl App {
                         color,
                     );
                 } else if self.overlay == Overlay::Step {
-                    // No value yet: show the surviving candidates as corner marks,
-                    // tinting those caught in a learned relationship (center marks).
+                    // No value yet: show the surviving candidates as center marks
+                    // (tinting those caught in a learned relationship), plus corner
+                    // marks for any digit propagation has confined to a few cells
+                    // of the box.
                     if let Some(st) = &self.stepper {
                         draw_candidates(
                             &painter,
                             cell_rect(r, c),
                             cell,
-                            &st.candidates(r, c),
-                            &st.center_candidates(r, c),
-                            candidate_color,
-                            center_color,
+                            &CandidateMarks {
+                                candidates: st.candidates(r, c),
+                                learned: st.learned_marks(r, c),
+                                corner: st.corner_marks(r, c),
+                                color: candidate_color,
+                                learned_color: LEARNED_MARK_COLOR,
+                                corner_color: CORNER_MARK_COLOR,
+                            },
                         );
                     }
                 }
@@ -495,6 +505,10 @@ impl App {
                 color_key(ui, egui::Color32::from_rgb(120, 200, 120), "search-placed");
                 color_key(ui, ui.visuals().weak_text_color(), "full-solve");
                 color_key(ui, ui.visuals().strong_text_color(), "given");
+                if self.overlay == Overlay::Step {
+                    color_key(ui, CORNER_MARK_COLOR, "corner mark (box-confined)");
+                    color_key(ui, LEARNED_MARK_COLOR, "learned relationship");
+                }
             });
             ui.add_space(2.0);
             // In Step mode the status tracks the live event; otherwise the last
@@ -570,36 +584,83 @@ fn draw_grid_lines(
     }
 }
 
-/// Draw the surviving candidate digits of a cell as a small 3×3 of corner marks,
-/// tinting any digit flagged as a center mark (part of a learned relationship).
-fn draw_candidates(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    cell: f32,
-    candidates: &[bool; 9],
-    center_marks: &[bool; 9],
+/// A cell's pencil-mark state for the Step view: the per-value flags plus the
+/// palette to paint them with.
+struct CandidateMarks {
+    /// Values still Boolean-possible in the cell (center marks).
+    candidates: [bool; 9],
+    /// Center marks caught in a learned relationship (tinted).
+    learned: [bool; 9],
+    /// Values propagation has confined to a few cells of the box (corner marks).
+    corner: [bool; 9],
     color: egui::Color32,
-    center_color: egui::Color32,
-) {
-    // Don't clutter with a full house of candidates — only show once the search
-    // has meaningfully narrowed the cell.
-    if candidates.iter().filter(|&&b| b).count() > 6 {
-        return;
-    }
-    let sub = cell / 3.0;
-    for (i, &alive) in candidates.iter().enumerate() {
-        if !alive {
-            continue;
+    learned_color: egui::Color32,
+    corner_color: egui::Color32,
+}
+
+/// Draw a cell's pencil marks while the search runs (Step view): the surviving
+/// candidate digits laid out as a 3×3 of **center marks**, plus any **corner
+/// marks** — digits propagation has confined to a few cells of the 3×3 box,
+/// pinned to the cell's corners ("the 7 goes in one of these cells"). A center
+/// mark caught in a learned relationship is tinted; a digit promoted to a corner
+/// mark is drawn only in its corner, never twice.
+fn draw_candidates(painter: &egui::Painter, rect: egui::Rect, cell: f32, marks: &CandidateMarks) {
+    // Center marks: the full candidate list as a positional 3×3, but only once
+    // the search has meaningfully narrowed the cell — and never a digit promoted
+    // to a corner mark (drawn below instead of twice).
+    if marks.candidates.iter().filter(|&&b| b).count() <= 6 {
+        let sub = cell / 3.0;
+        for (i, &alive) in marks.candidates.iter().enumerate() {
+            if !alive || marks.corner[i] {
+                continue;
+            }
+            let (sr, sc) = (i / 3, i % 3);
+            let pos = rect.min + egui::vec2((sc as f32 + 0.5) * sub, (sr as f32 + 0.5) * sub);
+            let digit_color = if marks.learned[i] {
+                marks.learned_color
+            } else {
+                marks.color
+            };
+            painter.text(
+                pos,
+                egui::Align2::CENTER_CENTER,
+                (i + 1).to_string(),
+                egui::FontId::proportional(sub * 0.62),
+                digit_color,
+            );
         }
-        let (sr, sc) = (i / 3, i % 3);
-        let pos = rect.min + egui::vec2((sc as f32 + 0.5) * sub, (sr as f32 + 0.5) * sub);
-        let digit_color = if center_marks[i] { center_color } else { color };
+    }
+
+    // Corner marks: box-confined digits, one faint chip per corner (up to four),
+    // so they read even over the center marks behind them.
+    let inset = cell * 0.17;
+    let slots = [
+        egui::vec2(inset, inset),
+        egui::vec2(cell - inset, inset),
+        egui::vec2(inset, cell - inset),
+        egui::vec2(cell - inset, cell - inset),
+    ];
+    let chip = cell * 0.30;
+    for (slot, digit) in marks
+        .corner
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &m)| m.then_some(i))
+        .take(slots.len())
+        .enumerate()
+    {
+        let center = rect.min + slots[slot];
+        painter.rect_filled(
+            egui::Rect::from_center_size(center, egui::vec2(chip, chip)),
+            2.0,
+            marks.corner_color.gamma_multiply(0.22),
+        );
         painter.text(
-            pos,
+            center,
             egui::Align2::CENTER_CENTER,
-            (i + 1).to_string(),
-            egui::FontId::proportional(sub * 0.62),
-            digit_color,
+            (digit + 1).to_string(),
+            egui::FontId::proportional(cell * 0.26),
+            marks.corner_color,
         );
     }
 }

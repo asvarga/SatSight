@@ -46,7 +46,7 @@ code.
 | ------------------ | ------------------------------------------------------------------------------------- |
 | `satsight-core`    | Solver-agnostic core: the registry (the bridge), CNF/encodings, the `Solver` trait, a BatSat backend, and the propagation/probing deduction engine. No egui, no wasm. |
 | `satsight-puzzles` | The `Puzzle` trait plus concrete puzzles (Sudoku primary). Built on `satsight-core`.  |
-| `satsight-app`     | The demo frontend (a CLI today; eframe/egui + wasm via trunk in later milestones).    |
+| `satsight-app`     | The demo frontend — an eframe/egui window (renders the grid, edits givens, shows deductions vs. the full solve). Native today; wasm via trunk in a later milestone. |
 
 ## Commands
 

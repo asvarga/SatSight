@@ -11,8 +11,8 @@
 #   RELEASE=1 main    # optimized build instead (slower rebuilds)
 #   NO_WATCH=1 main   # one-shot: build and run once, no watching
 #
-# Runs `satsight-app` — a CLI demo today; the egui/eframe window arrives in
-# milestone 4. Works from any cwd (resolves the repo root from its own path).
+# Opens the `satsight-app` egui/eframe window. Works from any cwd (resolves the
+# repo root from its own path).
 #
 set -euo pipefail
 

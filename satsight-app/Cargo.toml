@@ -1,6 +1,6 @@
 [package]
 name = "satsight-app"
-description = "The SatSight demo frontend. Milestone 4+ turns this into an eframe/egui app (native + wasm via trunk); for now it is a thin placeholder over the core + puzzles crates."
+description = "The SatSight demo frontend: an eframe/egui app that renders the Sudoku grid, edits givens, and visualizes both pure-logic deductions and the full solve. Native today; wasm via trunk in a later milestone."
 edition.workspace = true
 version.workspace = true
 
@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 satsight-core = { workspace = true }
 satsight-puzzles = { workspace = true }
+eframe = { workspace = true }
 
 [lints]
 workspace = true

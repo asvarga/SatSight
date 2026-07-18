@@ -25,6 +25,10 @@ rustsat = { version = "0.7.5", default-features = false }
 # is tested against (plan §5).
 rustsat-batsat = "0.7.5"
 
+# The egui/eframe immediate-mode GUI toolkit for the demo frontend. Only
+# satsight-app depends on it — the core and puzzles crates stay frontend-free.
+eframe = "0.29"
+
 [workspace.lints.clippy]
 pedantic = "warn"
 # A small allow-list of pedantic lints that tend to be more noise than signal

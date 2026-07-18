@@ -325,8 +325,13 @@ pub fn render(grid: &Grid<SudokuCell>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{render, Sudoku, SudokuCell};
-    use crate::puzzle::{deduce, solve, Grid};
+    use super::{render, Cell, Sudoku, SudokuCell};
+    use crate::puzzle::{deduce, solve, Grid, Puzzle};
+    use satsight_core::cdcl::Cdcl;
+    use satsight_core::registry::Registry;
+    use satsight_core::solver::{SolveOutcome, Solver};
+    use satsight_core::view::SolverView;
+    use satsight_core::Cnf;
 
     const PUZZLE: &str =
         "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79";
@@ -388,6 +393,50 @@ mod tests {
         let grid = solve(&puzzle).expect("the sample puzzle is satisfiable");
         assert_eq!(grid_to_string(&grid), SOLUTION);
         assert!(is_valid_solution(&grid));
+    }
+
+    #[test]
+    fn observable_cdcl_solves_the_full_sudoku() {
+        // Milestone 2: the hand-written stepping CDCL must handle the real
+        // 729-variable instance and land on the unique solution — the same answer
+        // BatSat gives (plan §5's oracle check, at full scale).
+        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
+        let mut reg = Registry::new();
+        let mut cnf = Cnf::new();
+        puzzle.encode_rules(&mut reg, &mut cnf);
+        let assumptions = puzzle.assumptions(&reg);
+
+        let mut solver = Cdcl::from_cnf(&cnf);
+        let SolveOutcome::Sat(model) = solver.solve(&assumptions) else {
+            panic!("the sample puzzle is satisfiable");
+        };
+        let grid = puzzle.project(&SolverView::from_model(&reg, &model));
+        assert_eq!(grid_to_string(&grid), SOLUTION);
+        assert!(is_valid_solution(&grid));
+    }
+
+    #[test]
+    fn observable_cdcl_reports_a_core_for_contradictory_givens() {
+        // Two 5s in row 0: the stepping CDCL must return UNSAT with a core drawn
+        // from the givens (plan §4) — the raw material for the core→clues highlight.
+        let mut ascii = String::from("55");
+        ascii.push_str(&".".repeat(79));
+        let puzzle = Sudoku::from_ascii(&ascii).unwrap();
+        let mut reg = Registry::new();
+        let mut cnf = Cnf::new();
+        puzzle.encode_rules(&mut reg, &mut cnf);
+        let assumptions = puzzle.assumptions(&reg);
+
+        let mut solver = Cdcl::from_cnf(&cnf);
+        let SolveOutcome::Unsat(core) = solver.solve(&assumptions) else {
+            panic!("two 5s in a row contradict");
+        };
+        assert!(!core.is_empty());
+        // Every core literal decodes to one of the two conflicting givens.
+        for lit in &core {
+            let (cell, holds): (Cell, bool) = reg.decode(*lit).expect("core is over given vars");
+            assert!(holds && cell.r == 0 && cell.v == 5 && (cell.c == 0 || cell.c == 1));
+        }
     }
 
     #[test]

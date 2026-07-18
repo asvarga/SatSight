@@ -344,6 +344,7 @@ impl App {
         let logic_color = egui::Color32::from_rgb(80, 160, 255);
         let search_color = egui::Color32::from_rgb(120, 200, 120);
         let candidate_color = visuals.weak_text_color().gamma_multiply(0.75);
+        let center_color = egui::Color32::from_rgb(210, 150, 90);
         let sel_color = visuals.selection.bg_fill;
         let core_color = egui::Color32::from_rgb(200, 70, 70).gamma_multiply(0.30);
         let emphasis_color = egui::Color32::from_rgb(240, 190, 90);
@@ -406,38 +407,24 @@ impl App {
                         color,
                     );
                 } else if self.overlay == Overlay::Step {
-                    // No value yet: show the surviving candidates as corner marks.
+                    // No value yet: show the surviving candidates as corner marks,
+                    // tinting those caught in a learned relationship (center marks).
                     if let Some(st) = &self.stepper {
                         draw_candidates(
                             &painter,
                             cell_rect(r, c),
                             cell,
                             &st.candidates(r, c),
+                            &st.center_candidates(r, c),
                             candidate_color,
+                            center_color,
                         );
                     }
                 }
             }
         }
 
-        for i in 0..=9 {
-            let stroke = if i % 3 == 0 { thick } else { thin };
-            let offset = i as f32 * cell;
-            painter.line_segment(
-                [
-                    egui::pos2(origin.x + offset, rect.min.y),
-                    egui::pos2(origin.x + offset, rect.max.y),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(rect.min.x, origin.y + offset),
-                    egui::pos2(rect.max.x, origin.y + offset),
-                ],
-                stroke,
-            );
-        }
+        draw_grid_lines(&painter, rect, origin, cell, thin, thick);
 
         if response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
@@ -494,15 +481,102 @@ impl App {
             ui.add(egui::Slider::new(&mut self.speed, 1..=200).text("steps/frame"));
         });
     }
+
+    /// The bottom status bar: the colour legend plus the live/last status line.
+    fn draw_status(&self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                color_key(ui, egui::Color32::from_rgb(80, 160, 255), "logic-proven");
+                color_key(ui, egui::Color32::from_rgb(120, 200, 120), "search-placed");
+                color_key(ui, ui.visuals().weak_text_color(), "full-solve");
+                color_key(ui, ui.visuals().strong_text_color(), "given");
+            });
+            ui.add_space(2.0);
+            // In Step mode the status tracks the live event; otherwise the last
+            // action's summary.
+            let line = match (self.overlay, &self.stepper) {
+                (Overlay::Step, Some(st)) => st.description(),
+                _ => self.status.clone(),
+            };
+            ui.label(line);
+            ui.add_space(4.0);
+        });
+    }
+
+    /// While stepping, a right-hand panel listing the short learned clauses
+    /// decoded to puzzle terms (plan §9). Most CDCL clauses are noisy, so the
+    /// stepper keeps only the readable ones.
+    fn draw_learned_panel(&self, ctx: &egui::Context) {
+        if self.overlay != Overlay::Step {
+            return;
+        }
+        let learned = self
+            .stepper
+            .as_ref()
+            .map(Stepper::learned_relationships)
+            .unwrap_or_default();
+        egui::SidePanel::right("learned")
+            .resizable(false)
+            .default_width(212.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.heading("Learned");
+                ui.label("Short clauses the solver discovered, in the puzzle's language:");
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if learned.is_empty() {
+                        ui.weak("(none yet — these appear when the search backtracks)");
+                    } else {
+                        for line in learned.iter().rev() {
+                            ui.monospace(line);
+                        }
+                    }
+                });
+            });
+    }
 }
 
-/// Draw the surviving candidate digits of a cell as a small 3×3 of corner marks.
+/// Draw the 9×9 grid lines, thick every third line to mark the boxes.
+fn draw_grid_lines(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    origin: egui::Pos2,
+    cell: f32,
+    thin: egui::Stroke,
+    thick: egui::Stroke,
+) {
+    for i in 0..=9 {
+        let stroke = if i % 3 == 0 { thick } else { thin };
+        let offset = i as f32 * cell;
+        painter.line_segment(
+            [
+                egui::pos2(origin.x + offset, rect.min.y),
+                egui::pos2(origin.x + offset, rect.max.y),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.min.x, origin.y + offset),
+                egui::pos2(rect.max.x, origin.y + offset),
+            ],
+            stroke,
+        );
+    }
+}
+
+/// Draw the surviving candidate digits of a cell as a small 3×3 of corner marks,
+/// tinting any digit flagged as a center mark (part of a learned relationship).
 fn draw_candidates(
     painter: &egui::Painter,
     rect: egui::Rect,
     cell: f32,
     candidates: &[bool; 9],
+    center_marks: &[bool; 9],
     color: egui::Color32,
+    center_color: egui::Color32,
 ) {
     // Don't clutter with a full house of candidates — only show once the search
     // has meaningfully narrowed the cell.
@@ -515,13 +589,14 @@ fn draw_candidates(
             continue;
         }
         let (sr, sc) = (i / 3, i % 3);
-        let center = rect.min + egui::vec2((sc as f32 + 0.5) * sub, (sr as f32 + 0.5) * sub);
+        let pos = rect.min + egui::vec2((sc as f32 + 0.5) * sub, (sr as f32 + 0.5) * sub);
+        let digit_color = if center_marks[i] { center_color } else { color };
         painter.text(
-            center,
+            pos,
             egui::Align2::CENTER_CENTER,
             (i + 1).to_string(),
             egui::FontId::proportional(sub * 0.62),
-            color,
+            digit_color,
         );
     }
 }
@@ -587,25 +662,8 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                color_key(ui, egui::Color32::from_rgb(80, 160, 255), "logic-proven");
-                color_key(ui, egui::Color32::from_rgb(120, 200, 120), "search-placed");
-                color_key(ui, ui.visuals().weak_text_color(), "full-solve");
-                color_key(ui, ui.visuals().strong_text_color(), "given");
-            });
-            ui.add_space(2.0);
-            // In Step mode the status tracks the live event; otherwise the last
-            // action's summary.
-            let line = match (self.overlay, &self.stepper) {
-                (Overlay::Step, Some(st)) => st.description(),
-                _ => self.status.clone(),
-            };
-            ui.label(line);
-            ui.add_space(4.0);
-        });
+        self.draw_status(ctx);
+        self.draw_learned_panel(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(6.0);

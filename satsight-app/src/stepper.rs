@@ -27,11 +27,21 @@ pub enum Emphasis {
     Cells(Vec<(usize, usize)>),
 }
 
+/// The most recent short learned clauses to keep for the overlay.
+const LEARNED_KEPT: usize = 16;
+
+/// The longest learned clause worth showing as a "discovered relationship"
+/// (plan §8: raw CDCL clauses are noisy; filter to short, readable ones).
+const LEARNED_MAX_LITS: usize = 3;
+
 /// Drives a [`Search`] event-by-event and decodes its state for the grid.
 pub struct Stepper {
     reg: Registry<Cell>,
     search: Search,
     last: Option<Event>,
+    /// Recently learned short clauses, decoded to `(cell, holds)` relationships
+    /// (plan §8's center-mark / learned-clause feed).
+    learned: Vec<Vec<(Cell, bool)>>,
     /// Whether the UI is auto-advancing (owned here so the app can toggle it).
     pub playing: bool,
 }
@@ -45,15 +55,34 @@ impl Stepper {
             reg,
             search,
             last: None,
+            learned: Vec::new(),
             playing: false,
         }
     }
 
     /// Advance by one event, unless already terminal.
     pub fn step(&mut self) {
-        if !self.search.is_done() {
-            self.last = Some(self.search.step());
+        if self.search.is_done() {
+            return;
         }
+        let event = self.search.step();
+        // Retain short learned clauses, decoded to puzzle relationships.
+        if let Event::Learn { clause } = &event {
+            if clause.len() <= LEARNED_MAX_LITS {
+                let rel: Vec<(Cell, bool)> = clause
+                    .iter()
+                    .filter_map(|&lit| self.reg.decode(lit))
+                    .collect();
+                if !rel.is_empty() {
+                    self.learned.push(rel);
+                    if self.learned.len() > LEARNED_KEPT {
+                        let overflow = self.learned.len() - LEARNED_KEPT;
+                        self.learned.drain(0..overflow);
+                    }
+                }
+            }
+        }
+        self.last = Some(event);
     }
 
     /// Whether the search has reached SAT or UNSAT.
@@ -161,6 +190,33 @@ impl Stepper {
         }
     }
 
+    /// The retained learned clauses, each decoded to a one-line relationship in
+    /// the puzzle's own language (e.g. `r1c2≠3 ∨ r4c2≠3`) — plan §9's side panel.
+    #[must_use]
+    pub fn learned_relationships(&self) -> Vec<String> {
+        self.learned
+            .iter()
+            .map(|rel| format_relationship(rel))
+            .collect()
+    }
+
+    /// Per-value center marks for `(r, c)`: entry `v - 1` is `true` when value `v`
+    /// appears in a retained learned clause touching this cell — the
+    /// discovered-relationship tier (plan §8), distinct from the corner-mark
+    /// candidates.
+    #[must_use]
+    pub fn center_candidates(&self, r: usize, c: usize) -> [bool; 9] {
+        let mut center = [false; 9];
+        for rel in &self.learned {
+            for (cell, _) in rel {
+                if cell.r == r && cell.c == c {
+                    center[usize::from(cell.v - 1)] = true;
+                }
+            }
+        }
+        center
+    }
+
     /// Decode a literal to its Sudoku cell. Every rule/learned literal is a
     /// `Cell` proposition (Sudoku's pairwise encoding mints no aux variables), so
     /// this never fails in practice.
@@ -169,6 +225,18 @@ impl Stepper {
             .decode(lit)
             .expect("every literal decodes to a cell")
     }
+}
+
+/// Format a decoded learned clause as a readable disjunction, e.g.
+/// `r1c2≠3 ∨ r4c2≠3` ("these two cells can't both be 3").
+fn format_relationship(rel: &[(Cell, bool)]) -> String {
+    rel.iter()
+        .map(|(cell, holds)| {
+            let op = if *holds { "=" } else { "≠" };
+            format!("r{}c{}{op}{}", cell.r + 1, cell.c + 1, cell.v)
+        })
+        .collect::<Vec<_>>()
+        .join(" ∨ ")
 }
 
 #[cfg(test)]
@@ -229,6 +297,44 @@ mod tests {
                 let live = stepper.candidates(r, c).iter().filter(|&&b| b).count();
                 assert_eq!(live, 1, "a solved cell keeps a single candidate");
             }
+        }
+    }
+
+    #[test]
+    fn learned_clauses_become_readable_relationships_and_center_marks() {
+        // Inject a decoded learned clause (as the Learn path would) and check it
+        // reads as a disjunction and surfaces as center marks on its cells.
+        let mut stepper = stepper_for(&Sudoku::empty());
+        stepper.learned.push(vec![
+            (Cell { r: 0, c: 1, v: 3 }, false),
+            (Cell { r: 3, c: 1, v: 3 }, false),
+        ]);
+        assert_eq!(
+            stepper.learned_relationships(),
+            vec!["r1c2≠3 ∨ r4c2≠3".to_string()]
+        );
+        // Value 3 (index 2) is flagged in both cells, and nowhere else.
+        assert!(stepper.center_candidates(0, 1)[2]);
+        assert!(stepper.center_candidates(3, 1)[2]);
+        assert!(!stepper.center_candidates(0, 0)[2]);
+        assert!(!stepper.center_candidates(0, 1)[0]);
+    }
+
+    #[test]
+    fn stepping_only_ever_retains_short_decodable_relationships() {
+        // Whatever the search learns while solving, the retained relationships
+        // must all be short (≤3 literals) and decode to real cells — the filter
+        // that keeps the overlay readable (plan §8).
+        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
+        let mut stepper = stepper_for(&puzzle);
+        while !stepper.is_done() {
+            stepper.step();
+        }
+        for rel in &stepper.learned {
+            assert!((1..=3).contains(&rel.len()), "retained clauses are short");
+        }
+        for line in stepper.learned_relationships() {
+            assert!(line.contains('r'), "a relationship names cells");
         }
     }
 

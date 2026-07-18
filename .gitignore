@@ -1,0 +1,8 @@
+/target
+.DS_Store
+*.swp
+# direnv's local cache for the nix dev shell (see .envrc / nix/flake.nix).
+.direnv/
+# Claude Code local overrides and worktrees (see .envrc).
+.claude/settings.local.json
+.claude/worktrees/

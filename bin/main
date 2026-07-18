@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# bin/main — launch the desktop GUI with hot reloading.
+#
+# `cargo watch` rebuilds and relaunches the egui window whenever a Rust source
+# or a Cargo manifest changes, so edits show up in a fresh window without a
+# manual restart.
+#
+# With ./bin on PATH (see .envrc), just run `main` from anywhere in the repo.
+#
+#   main              # watch sources; rebuild + relaunch on change (debug)
+#   RELEASE=1 main    # optimized build instead (slower rebuilds)
+#   NO_WATCH=1 main   # one-shot: build and open the window, no watching
+#
+# Opens a native window (egui/eframe). Works from any cwd (resolves the repo
+# root from its own path).
+#
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/.." && pwd)"
+cd "$root"
+
+# Debug builds by default: hot-reload rebuilds have to be fast to be useful.
+profile=""
+[ "${RELEASE:-}" = "1" ] && profile="--release"
+
+# One-shot mode, or a graceful fallback when cargo-watch isn't installed (the
+# nix dev shell provides it; a bare `cargo` install may not).
+if [ "${NO_WATCH:-}" = "1" ] || ! command -v cargo-watch >/dev/null 2>&1; then
+  [ "${NO_WATCH:-}" = "1" ] ||
+    echo "bin/main: cargo-watch not found — running once without hot reload." >&2
+  # shellcheck disable=SC2086
+  exec cargo run $profile -p template-gui -- "$@"
+fi
+
+# Hot reload: watch the crate sources + manifests and restart the GUI on every
+# change. cargo-watch SIGTERMs the running window, rebuilds, and relaunches it.
+# shellcheck disable=SC2086
+exec cargo watch \
+  -w template-core -w template-gui -w Cargo.toml \
+  --clear --why \
+  -x "run $profile -p template-gui -- $*"

@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+  "template-core",
+  "template-gui",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Internal crates. The GUI depends on the core library; keep the edges pointing
+# one way (gui -> core) so the core stays reusable and frontend-free.
+template-core = { version = "0.1.0", path = "template-core" }
+
+# The egui/eframe immediate-mode GUI toolkit for the desktop frontend.
+eframe = "0.29"
+# Derive-based (de)serialization; used to persist the GUI's state through
+# eframe's storage layer. Features are selected per-crate.
+serde = "1.0"
+
+[workspace.lints.clippy]
+pedantic = "warn"
+# A small allow-list of pedantic lints that tend to be more noise than signal.
+# Trim or extend it to taste.
+missing_errors_doc = { level = "allow", priority = 1 }
+missing_panics_doc = { level = "allow", priority = 1 }

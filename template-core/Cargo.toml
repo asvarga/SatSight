@@ -1,0 +1,10 @@
+[package]
+name = "template-core"
+description = "Core library for the template workspace. Put your reusable, frontend-free logic here; the GUI depends on it."
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

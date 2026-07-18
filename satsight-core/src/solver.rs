@@ -41,6 +41,12 @@ impl Assignment {
         }
     }
 
+    /// An assignment from a per-variable value vector (index = variable index).
+    #[must_use]
+    pub fn from_values(values: Vec<Option<bool>>) -> Self {
+        Self { values }
+    }
+
     /// Record that `var` takes `value`, growing the backing store as needed.
     pub fn set(&mut self, var: Var, value: bool) {
         let i = var.idx();

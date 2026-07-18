@@ -19,7 +19,7 @@ use satsight_core::encodings::exactly_one_pairwise;
 use satsight_core::registry::Registry;
 use satsight_core::view::SolverView;
 
-use crate::puzzle::{Grid, Puzzle};
+use crate::puzzle::{deduce, Deductions, Grid, Puzzle};
 
 /// Board side length.
 const N: usize = 9;
@@ -211,6 +211,93 @@ impl Puzzle for Sudoku {
     }
 }
 
+/// A human-readable summary of what pure logic proves about a board (see
+/// [`Sudoku::logic_report`]).
+#[derive(Debug, Clone)]
+pub struct LogicReport {
+    /// Whether propagation found the givens consistent (see
+    /// [`Deductions::satisfiable`]).
+    pub satisfiable: bool,
+    /// Number of givens on the board.
+    pub givens: usize,
+    /// Cells proven to a value by logic alone (excluding givens), sorted.
+    pub placements: Vec<(usize, usize, u8)>,
+    /// Number of candidate eliminations proven ("cell (r,c) can't be v").
+    pub eliminations: usize,
+}
+
+impl LogicReport {
+    /// Cells known after logic: givens plus proven placements.
+    #[must_use]
+    pub fn solved_cells(&self) -> usize {
+        self.givens + self.placements.len()
+    }
+
+    /// Whether logic alone determined every one of the 81 cells.
+    #[must_use]
+    pub fn fully_solved(&self) -> bool {
+        self.solved_cells() == N * N
+    }
+}
+
+impl Sudoku {
+    /// Number of givens on the board.
+    #[must_use]
+    pub fn given_count(&self) -> usize {
+        self.givens
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter(|cell| cell.is_some())
+            .count()
+    }
+
+    /// Summarize a set of [`Deductions`] for this board.
+    #[must_use]
+    pub fn logic_report_from(&self, deductions: &Deductions<Cell>) -> LogicReport {
+        let mut placements = Vec::new();
+        let mut eliminations = 0;
+        for (cell, holds) in &deductions.proven {
+            if *holds {
+                placements.push((cell.r, cell.c, cell.v));
+            } else {
+                eliminations += 1;
+            }
+        }
+        placements.sort_unstable();
+        LogicReport {
+            satisfiable: deductions.satisfiable,
+            givens: self.given_count(),
+            placements,
+            eliminations,
+        }
+    }
+
+    /// Solve as far as pure logic allows and summarize it — a one-shot
+    /// convenience over [`deduce`] + [`logic_report_from`](Sudoku::logic_report_from).
+    #[must_use]
+    pub fn logic_report(&self) -> LogicReport {
+        self.logic_report_from(&deduce(self))
+    }
+
+    /// A grid showing only what logic proves: givens plus forced placements.
+    ///
+    /// Cells that still need search are left blank — so rendering this next to
+    /// the full solution shows exactly how far deduction alone gets.
+    #[must_use]
+    pub fn project_deductions(&self, deductions: &Deductions<Cell>) -> Grid<SudokuCell> {
+        let mut values = self.givens;
+        for (cell, holds) in &deductions.proven {
+            if *holds {
+                values[cell.r][cell.c] = Some(cell.v);
+            }
+        }
+        Grid::from_fn(N, N, |r, c| SudokuCell {
+            value: values[r][c],
+            given: self.givens[r][c].is_some(),
+        })
+    }
+}
+
 /// Render a projected grid as text, with box separators.
 #[must_use]
 pub fn render(grid: &Grid<SudokuCell>) -> String {
@@ -239,7 +326,7 @@ pub fn render(grid: &Grid<SudokuCell>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{render, Sudoku, SudokuCell};
-    use crate::puzzle::{solve, Grid};
+    use crate::puzzle::{deduce, solve, Grid};
 
     const PUZZLE: &str =
         "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79";
@@ -340,5 +427,66 @@ mod tests {
         let text = render(&grid);
         // 9 value rows + 2 separator rows.
         assert_eq!(text.lines().count(), 11);
+    }
+
+    #[test]
+    fn logic_proves_only_correct_facts() {
+        // Every fact pure logic proves about the sample must agree with the
+        // unique solution: placements are right, eliminations are genuinely
+        // absent from the solution.
+        let puzzle = Sudoku::easy_sample();
+        let deductions = deduce(&puzzle);
+        assert!(deductions.satisfiable);
+        let sol = SOLUTION.as_bytes();
+        for (cell, holds) in &deductions.proven {
+            let solution_digit = sol[cell.r * 9 + cell.c] - b'0';
+            if *holds {
+                assert_eq!(cell.v, solution_digit, "forced placement must be correct");
+            } else {
+                assert_ne!(
+                    cell.v, solution_digit,
+                    "eliminated value must not be the answer"
+                );
+            }
+        }
+        // The sample is easy enough that logic makes real progress.
+        let report = puzzle.logic_report_from(&deductions);
+        assert!(report.solved_cells() > report.givens);
+    }
+
+    #[test]
+    fn deduction_grid_matches_the_solution_where_filled() {
+        let puzzle = Sudoku::easy_sample();
+        let deductions = deduce(&puzzle);
+        let partial = puzzle.project_deductions(&deductions);
+        let sol = SOLUTION.as_bytes();
+        for r in 0..9 {
+            for c in 0..9 {
+                if let Some(v) = partial.get(r, c).value {
+                    assert_eq!(v, sol[r * 9 + c] - b'0');
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_board_proves_nothing() {
+        // With no givens, logic cannot force anything, but the board is fine.
+        let report = Sudoku::empty().logic_report();
+        assert!(report.satisfiable);
+        assert_eq!(report.givens, 0);
+        assert!(report.placements.is_empty());
+        assert_eq!(report.eliminations, 0);
+    }
+
+    #[test]
+    fn contradictory_givens_are_detected_by_logic() {
+        // Two 5s in row 0 — propagation alone must spot the contradiction.
+        let mut ascii = String::from("55");
+        ascii.push_str(&".".repeat(79));
+        let puzzle = Sudoku::from_ascii(&ascii).unwrap();
+        assert!(!puzzle.logic_report().satisfiable);
+        // …and the full backend agrees it is unsolvable.
+        assert!(solve(&puzzle).is_none());
     }
 }

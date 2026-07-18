@@ -30,6 +30,20 @@ pub fn clause<I: IntoIterator<Item = Lit>>(lits: I) -> Clause {
     cl
 }
 
+/// The number of distinct variables a CNF spans: the highest variable index
+/// used anywhere, plus one (0 for an empty CNF).
+///
+/// Both the BatSat backend and the propagator size their per-variable state by
+/// this, so it lives here rather than being reinvented in each.
+#[must_use]
+pub fn var_count(cnf: &Cnf) -> usize {
+    cnf.iter()
+        .flat_map(|clause| clause.iter())
+        .map(|lit| lit.var().idx() + 1)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Hands out fresh SAT variables that have no puzzle-level meaning.
 ///
 /// Encodings that need auxiliary variables (the sequential at-most-one, later

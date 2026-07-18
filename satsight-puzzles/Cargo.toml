@@ -1,0 +1,12 @@
+[package]
+name = "satsight-puzzles"
+description = "The Puzzle trait plus concrete puzzles (Sudoku primary). Depends on satsight-core; proves the reduction abstraction is not Sudoku-shaped."
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+satsight-core = { workspace = true }
+rustsat = { workspace = true }
+
+[lints]
+workspace = true

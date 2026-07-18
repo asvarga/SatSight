@@ -1,0 +1,12 @@
+[package]
+name = "satsight-core"
+description = "Solver-agnostic core for SatSight: the puzzle<->SAT registry (the bridge), CNF/encoding helpers, the Solver trait + event model, a BatSat backend, and the decoded SolverView. No egui, no wasm."
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+rustsat = { workspace = true }
+rustsat-batsat = { workspace = true }
+
+[lints]
+workspace = true

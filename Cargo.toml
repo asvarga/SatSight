@@ -1,8 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-  "template-core",
-  "template-gui",
+  "satsight-core",
+  "satsight-puzzles",
+  "satsight-app",
 ]
 
 [workspace.package]
@@ -10,19 +11,29 @@ edition = "2021"
 version = "0.1.0"
 
 [workspace.dependencies]
-# Internal crates. The GUI depends on the core library; keep the edges pointing
-# one way (gui -> core) so the core stays reusable and frontend-free.
-template-core = { version = "0.1.0", path = "template-core" }
+# Internal crates. Dependency edges point one way: app -> puzzles -> core.
+# The core stays solver-agnostic and frontend-free; the puzzles crate proves the
+# abstraction is not Sudoku-shaped; only the app touches egui/wasm.
+satsight-core = { version = "0.1.0", path = "satsight-core" }
+satsight-puzzles = { version = "0.1.0", path = "satsight-puzzles" }
 
-# The egui/eframe immediate-mode GUI toolkit for the desktop frontend.
-eframe = "0.29"
-# Derive-based (de)serialization; used to persist the GUI's state through
-# eframe's storage layer. Features are selected per-crate.
-serde = "1.0"
+# SAT toolkit: we adopt rustsat's `Var`/`Lit`/`Clause`/`Cnf` types wholesale
+# (plan §11) so both backends and the encodings speak one vocabulary.
+rustsat = { version = "0.7.5", default-features = false }
+# BatSat: a pure-Rust CDCL solver, the recommended choice for WebAssembly. Used
+# as the fast "run to solution" backend and as the oracle the hand-written CDCL
+# is tested against (plan §5).
+rustsat-batsat = "0.7.5"
 
 [workspace.lints.clippy]
 pedantic = "warn"
-# A small allow-list of pedantic lints that tend to be more noise than signal.
-# Trim or extend it to taste.
+# A small allow-list of pedantic lints that tend to be more noise than signal
+# for a doc-heavy SAT library. Trim or extend to taste.
 missing_errors_doc = { level = "allow", priority = 1 }
 missing_panics_doc = { level = "allow", priority = 1 }
+# Descriptive docs mention CNF, SAT, BatSat, Sudoku, … — not code identifiers.
+doc_markdown = { level = "allow", priority = 1 }
+# We don't chase #[must_use] on every getter.
+must_use_candidate = { level = "allow", priority = 1 }
+# `cnf::Cnf`, `sudoku::Sudoku`, `registry::Registry` read fine.
+module_name_repetitions = { level = "allow", priority = 1 }

@@ -1,0 +1,16 @@
+[package]
+name = "satsight-app"
+description = "The SatSight demo frontend. Milestone 4+ turns this into an eframe/egui app (native + wasm via trunk); for now it is a thin placeholder over the core + puzzles crates."
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "satsight-app"
+path = "src/main.rs"
+
+[dependencies]
+satsight-core = { workspace = true }
+satsight-puzzles = { workspace = true }
+
+[lints]
+workspace = true

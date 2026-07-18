@@ -113,6 +113,27 @@ impl Sudoku {
         .expect("the built-in sample is a valid 81-cell board")
     }
 
+    /// A deliberately hard Sudoku ("AI Escargot", a well-known minimal puzzle
+    /// with a unique solution). Unlike [`easy_sample`](Sudoku::easy_sample),
+    /// propagation + failed-literal probing places only one cell here, so the
+    /// solver *must* search — making it the ideal default for watching the CDCL
+    /// step past where pure logic stalls.
+    #[must_use]
+    pub fn hard_sample() -> Self {
+        Self::from_ascii(
+            "1....7.9.\
+             .3..2...8\
+             ..96..5..\
+             ..53..9..\
+             .1..8...2\
+             6....4...\
+             3......1.\
+             .4......7\
+             ..7...3..",
+        )
+        .expect("the built-in hard sample is a valid 81-cell board")
+    }
+
     /// The nine `(r, c)` coordinates of box `b` (`0..9`, left-to-right,
     /// top-to-bottom).
     fn box_cells(b: usize) -> impl Iterator<Item = (usize, usize)> {
@@ -385,6 +406,24 @@ mod tests {
             }
         }
         true
+    }
+
+    #[test]
+    fn hard_sample_needs_search_but_stays_solvable() {
+        // The default board must actually exercise search: logic alone leaves it
+        // unfinished (that's the whole point of shipping it as the default), yet
+        // the givens are consistent and the full solver reaches a solution.
+        let puzzle = Sudoku::hard_sample();
+        let report = puzzle.logic_report();
+        assert!(report.satisfiable, "hard sample givens are consistent");
+        assert!(
+            !report.fully_solved(),
+            "hard sample must leave work for search — logic solved {}/{} cells",
+            report.solved_cells(),
+            super::N * super::N,
+        );
+        let grid = solve(&puzzle).expect("hard sample is satisfiable");
+        assert!(is_valid_solution(&grid), "full solve is a valid grid");
     }
 
     #[test]

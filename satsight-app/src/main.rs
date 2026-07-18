@@ -141,7 +141,7 @@ impl App {
         batsat.load_rules(&cnf);
 
         Self {
-            puzzle: Sudoku::easy_sample(),
+            puzzle: Sudoku::hard_sample(),
             selected: None,
             reg,
             cdcl,
@@ -449,7 +449,10 @@ impl App {
                 self.run_full();
             }
             ui.separator();
-            if ui.button("Sample").clicked() {
+            if ui.button("Hard sample").clicked() {
+                self.load(Sudoku::hard_sample());
+            }
+            if ui.button("Easy sample").clicked() {
                 self.load(Sudoku::easy_sample());
             }
             if ui.button("Empty").clicked() {

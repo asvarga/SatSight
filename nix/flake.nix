@@ -1,5 +1,5 @@
 {
-  description = "A template Rust workspace with an egui/eframe desktop frontend.";
+  description = "SatSight — a bidirectional SAT-reduction library with an egui/eframe demo.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";

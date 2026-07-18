@@ -6,11 +6,12 @@ page as a `.md` file in this folder and link it here.
 ## Layout
 
 ```
-template-core/   # Core library — reusable, frontend-free logic
-template-gui/    # egui/eframe desktop frontend, built on template-core
-docs/wiki/       # This wiki
-bin/             # Repo scripts on PATH (e.g. `main`)
-nix/             # Nix dev shell, loaded by direnv (.envrc)
+satsight-core/     # Solver-agnostic core: registry, encodings, solver, propagation
+satsight-puzzles/  # The Puzzle trait + Sudoku (built on satsight-core)
+satsight-app/      # Demo frontend (egui/eframe + wasm in later milestones)
+docs/wiki/         # This wiki (see satsight-plan.md for the full design)
+bin/               # Repo scripts on PATH (e.g. `main`)
+nix/               # Nix dev shell, loaded by direnv (.envrc)
 ```
 
 ## Start here

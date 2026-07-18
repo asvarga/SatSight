@@ -33,17 +33,20 @@ Details:
 
 ## What this is
 
-A template Rust workspace: a reusable core library plus an egui/eframe desktop
-frontend built on it. The crate boundary keeps dependency edges pointing one way
-(`gui → core`), so the core stays reusable and frontend-free — respect this when
-adding code.
+SatSight: a library for solving puzzles by reduction to SAT that can also project
+solver discoveries *back* into the puzzle's language, plus an egui/eframe demo.
+The full design is in `docs/wiki/satsight-plan.md` — treat it as the spec. The
+crate boundaries keep dependency edges pointing one way (`app → puzzles → core`),
+so the core stays solver-agnostic and frontend-free — respect this when adding
+code.
 
 ## Crates
 
-| Crate           | Role                                                                 |
-| --------------- | -------------------------------------------------------------------- |
-| `template-core` | The core library. Reusable, frontend-free logic lives here.          |
-| `template-gui`  | The desktop frontend — an egui/eframe app that drives `template-core`. |
+| Crate              | Role                                                                                   |
+| ------------------ | ------------------------------------------------------------------------------------- |
+| `satsight-core`    | Solver-agnostic core: the registry (the bridge), CNF/encodings, the `Solver` trait, a BatSat backend, and the propagation/probing deduction engine. No egui, no wasm. |
+| `satsight-puzzles` | The `Puzzle` trait plus concrete puzzles (Sudoku primary). Built on `satsight-core`.  |
+| `satsight-app`     | The demo frontend (a CLI today; eframe/egui + wasm via trunk in later milestones).    |
 
 ## Commands
 
@@ -51,12 +54,12 @@ adding code.
 cargo test --workspace                  # build + test everything (what CI runs)
 cargo fmt --all -- --check              # formatting (CI-enforced)
 cargo clippy --workspace --all-targets  # lints
-main                                     # run the GUI (hot-reloads on change)
+main                                     # run the app (hot-reloads on change)
 bin/main                                 # …same, by path, from any cwd
-cargo run -p template-gui                # …or run the GUI once, directly
+cargo run -p satsight-app                # …or run the app once, directly
 ```
 
-`bin/main` runs the GUI under `cargo watch`, rebuilding + relaunching on source
+`bin/main` runs the app under `cargo watch`, rebuilding + relaunching on source
 changes. `RELEASE=1` builds optimized; `NO_WATCH=1` runs once without watching.
 With the nix dev shell + direnv active (`.envrc`), `./bin` is on `PATH`, so the
 launcher is just `main`.

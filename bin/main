@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 #
-# bin/main — launch the desktop GUI with hot reloading.
+# bin/main — launch the SatSight app with hot reloading.
 #
-# `cargo watch` rebuilds and relaunches the egui window whenever a Rust source
-# or a Cargo manifest changes, so edits show up in a fresh window without a
-# manual restart.
+# `cargo watch` rebuilds and relaunches the app whenever a Rust source or a
+# Cargo manifest changes, so edits show up without a manual restart.
 #
 # With ./bin on PATH (see .envrc), just run `main` from anywhere in the repo.
 #
 #   main              # watch sources; rebuild + relaunch on change (debug)
 #   RELEASE=1 main    # optimized build instead (slower rebuilds)
-#   NO_WATCH=1 main   # one-shot: build and open the window, no watching
+#   NO_WATCH=1 main   # one-shot: build and run once, no watching
 #
-# Opens a native window (egui/eframe). Works from any cwd (resolves the repo
-# root from its own path).
+# Runs `satsight-app` — a CLI demo today; the egui/eframe window arrives in
+# milestone 4. Works from any cwd (resolves the repo root from its own path).
 #
 set -euo pipefail
 
@@ -31,13 +30,13 @@ if [ "${NO_WATCH:-}" = "1" ] || ! command -v cargo-watch >/dev/null 2>&1; then
   [ "${NO_WATCH:-}" = "1" ] ||
     echo "bin/main: cargo-watch not found — running once without hot reload." >&2
   # shellcheck disable=SC2086
-  exec cargo run $profile -p template-gui -- "$@"
+  exec cargo run $profile -p satsight-app -- "$@"
 fi
 
-# Hot reload: watch the crate sources + manifests and restart the GUI on every
-# change. cargo-watch SIGTERMs the running window, rebuilds, and relaunches it.
+# Hot reload: watch the crate sources + manifests and restart the app on every
+# change. cargo-watch SIGTERMs the running process, rebuilds, and relaunches it.
 # shellcheck disable=SC2086
 exec cargo watch \
-  -w template-core -w template-gui -w Cargo.toml \
+  -w satsight-core -w satsight-puzzles -w satsight-app -w Cargo.toml \
   --clear --why \
-  -x "run $profile -p template-gui -- $*"
+  -x "run $profile -p satsight-app -- $*"

@@ -2661,8 +2661,11 @@ name = "satsight-app"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "log",
  "satsight-core",
  "satsight-puzzles",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

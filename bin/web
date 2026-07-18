@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#
+# bin/web — serve the SatSight app in the browser via trunk (plan §9).
+#
+# Trunk compiles satsight-app to WebAssembly, runs wasm-bindgen, injects the
+# loader into index.html, and serves it with live reload on source changes.
+#
+# With ./bin on PATH (see .envrc), just run `web` from anywhere in the repo.
+#
+#   web               # trunk serve with auto-reload (debug); open the printed URL
+#   RELEASE=1 web     # optimized wasm (runs wasm-opt; smaller + faster, slower build)
+#   BUILD=1 web       # one-shot build into satsight-app/dist, no server
+#
+# Requires `trunk` and the wasm32-unknown-unknown target (both in the nix dev
+# shell). Works from any cwd (resolves the repo root from its own path).
+#
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/.." && pwd)"
+# Trunk resolves index.html's Cargo.toml relative to its working directory, so
+# run it from the app crate (this is the standard trunk workflow).
+cd "$root/satsight-app"
+
+if ! command -v trunk >/dev/null 2>&1; then
+  echo "bin/web: trunk not found — install it or enter the nix dev shell (see .envrc)." >&2
+  exit 1
+fi
+
+profile="--dev"
+[ "${RELEASE:-}" = "1" ] && profile="--release"
+
+# shellcheck disable=SC2086
+if [ "${BUILD:-}" = "1" ]; then
+  exec trunk build $profile
+fi
+exec trunk serve $profile "$@"

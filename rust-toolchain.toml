@@ -1,3 +1,6 @@
 [toolchain]
 channel = "stable"
 profile = "default"
+# The web build (satsight-app via trunk, plan §9) compiles to WebAssembly;
+# rustup installs this target automatically from this list.
+targets = ["wasm32-unknown-unknown"]

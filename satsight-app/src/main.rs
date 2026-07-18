@@ -33,6 +33,8 @@ use satsight_puzzles::{deduce, Grid, Puzzle};
 
 use stepper::{Emphasis, Stepper};
 
+/// Native entry point: open a window (plan §9; wasm entry point below).
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -45,6 +47,37 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|_cc| Ok(Box::new(App::new()))),
     )
+}
+
+/// Web entry point: mount the same app on a `<canvas>` via trunk/wasm-bindgen
+/// (plan §9). The solver is a non-blocking `step()` pump precisely so it runs on
+/// WASM's single thread.
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use eframe::wasm_bindgen::JsCast as _;
+
+    eframe::WebLogger::init(log::LevelFilter::Debug).ok();
+    let web_options = eframe::WebOptions::default();
+    wasm_bindgen_futures::spawn_local(async {
+        let canvas = web_sys::window()
+            .expect("a browser window")
+            .document()
+            .expect("a document")
+            .get_element_by_id("satsight_canvas")
+            .expect("an element with id `satsight_canvas`")
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .expect("`satsight_canvas` is a <canvas>");
+        let result = eframe::WebRunner::new()
+            .start(
+                canvas,
+                web_options,
+                Box::new(|_cc| Ok(Box::new(App::new()))),
+            )
+            .await;
+        if let Err(error) = result {
+            log::error!("failed to start SatSight: {error:?}");
+        }
+    });
 }
 
 /// Which decoded artifact the grid is currently painting over the givens.

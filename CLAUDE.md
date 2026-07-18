@@ -46,7 +46,7 @@ code.
 | ------------------ | ------------------------------------------------------------------------------------- |
 | `satsight-core`    | Solver-agnostic core: the registry (the bridge), CNF/encodings, the `Solver` trait, a BatSat backend, and the propagation/probing deduction engine. No egui, no wasm. |
 | `satsight-puzzles` | The `Puzzle` trait plus concrete puzzles (Sudoku primary). Built on `satsight-core`.  |
-| `satsight-app`     | The demo frontend — an eframe/egui window (renders the grid, edits givens, shows deductions vs. the full solve). Native today; wasm via trunk in a later milestone. |
+| `satsight-app`     | The demo frontend — an eframe/egui app (renders the grid, edits givens, shows deductions, the full solve, and the observable CDCL stepped one event at a time). Runs natively and in the browser (wasm via trunk). |
 
 ## Commands
 
@@ -54,15 +54,25 @@ code.
 cargo test --workspace                  # build + test everything (what CI runs)
 cargo fmt --all -- --check              # formatting (CI-enforced)
 cargo clippy --workspace --all-targets  # lints
-main                                     # run the app (hot-reloads on change)
+main                                     # run the app natively (hot-reloads on change)
 bin/main                                 # …same, by path, from any cwd
 cargo run -p satsight-app                # …or run the app once, directly
+web                                      # serve the app in the browser (trunk, live-reload)
+bin/web                                  # …same, by path, from any cwd
 ```
 
-`bin/main` runs the app under `cargo watch`, rebuilding + relaunching on source
-changes. `RELEASE=1` builds optimized; `NO_WATCH=1` runs once without watching.
+`bin/main` runs the native app under `cargo watch`, rebuilding + relaunching on
+source changes. `RELEASE=1` builds optimized; `NO_WATCH=1` runs once without
+watching.
+
+`bin/web` serves the wasm build via `trunk serve` (plan §9) with live reload;
+`RELEASE=1` runs `wasm-opt` for a smaller bundle, `BUILD=1` does a one-shot build
+into `satsight-app/dist`. Trunk must run from `satsight-app/` (it resolves
+`index.html`'s manifest relative to its cwd); the launcher handles that. Needs
+`trunk` and the `wasm32-unknown-unknown` target (both in the nix dev shell).
+
 With the nix dev shell + direnv active (`.envrc`), `./bin` is on `PATH`, so the
-launcher is just `main`.
+launchers are just `main` and `web`.
 
 ## Conventions
 

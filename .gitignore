@@ -6,3 +6,6 @@
 # Claude Code local overrides and worktrees (see .envrc).
 .claude/settings.local.json
 .claude/worktrees/
+
+# trunk web build output (satsight-app/dist)
+dist/

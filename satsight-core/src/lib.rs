@@ -16,6 +16,8 @@
 //! - [`encodings`] — exactly-one / at-most-one (pairwise + sequential).
 //! - [`solver`] — the [`Solver`] trait, [`Assignment`], and [`SolveOutcome`].
 //! - [`backend_batsat`] — the fast BatSat backend and test oracle.
+//! - [`propagate`] — the [`Propagator`]: BCP + failed-literal probing, the sound
+//!   deduction engine behind the backward map.
 //! - [`view`] — [`SolverView`], the decoded read model `project()` consumes.
 //!
 //! The hand-written steppable CDCL and the richer [`SolverView`] artifacts
@@ -24,12 +26,14 @@
 pub mod backend_batsat;
 pub mod cnf;
 pub mod encodings;
+pub mod propagate;
 pub mod registry;
 pub mod solver;
 pub mod view;
 
 pub use backend_batsat::BatSatBackend;
-pub use cnf::{clause, Clause, Cnf, Lit, Var, VarManager};
+pub use cnf::{clause, var_count, Clause, Cnf, Lit, Var, VarManager};
+pub use propagate::{Propagation, Propagator};
 pub use registry::Registry;
 pub use solver::{Assignment, SolveOutcome, Solver};
 pub use view::SolverView;

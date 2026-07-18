@@ -14,7 +14,7 @@ use rustsat::solvers::{Solve, SolveIncremental, SolverResult};
 use rustsat::types::TernaryVal;
 use rustsat_batsat::BasicSolver;
 
-use crate::cnf::{Cnf, Lit, Var};
+use crate::cnf::{var_count, Cnf, Lit, Var};
 use crate::solver::{Assignment, SolveOutcome, Solver};
 
 /// A [`Solver`] backed by BatSat via rustsat.
@@ -22,7 +22,7 @@ pub struct BatSatBackend {
     inner: BasicSolver,
     /// Number of distinct variables seen in the rule CNF; bounds the range we
     /// read back when materializing a model.
-    n_vars: u32,
+    n_vars: usize,
 }
 
 impl BatSatBackend {
@@ -42,15 +42,6 @@ impl BatSatBackend {
         backend.load_rules(cnf);
         backend.solve(assumptions)
     }
-
-    /// Highest variable index used anywhere in `cnf`, plus one (0 if empty).
-    fn count_vars(cnf: &Cnf) -> u32 {
-        cnf.iter()
-            .flat_map(|clause| clause.iter())
-            .map(|lit| lit.var().idx32() + 1)
-            .max()
-            .unwrap_or(0)
-    }
 }
 
 impl Default for BatSatBackend {
@@ -61,7 +52,7 @@ impl Default for BatSatBackend {
 
 impl Solver for BatSatBackend {
     fn load_rules(&mut self, cnf: &Cnf) {
-        self.n_vars = Self::count_vars(cnf);
+        self.n_vars = var_count(cnf);
         self.inner
             .add_cnf(cnf.clone())
             .expect("BatSat accepts the rule CNF");
@@ -78,9 +69,9 @@ impl Solver for BatSatBackend {
                     .inner
                     .full_solution()
                     .expect("a SAT result yields a full model");
-                let mut model = Assignment::with_capacity(self.n_vars as usize);
+                let mut model = Assignment::with_capacity(self.n_vars);
                 for i in 0..self.n_vars {
-                    let var = Var::new(i);
+                    let var = Var::new(u32::try_from(i).expect("variable index fits in u32"));
                     match solution.var_value(var) {
                         TernaryVal::True => model.set(var, true),
                         TernaryVal::False => model.set(var, false),

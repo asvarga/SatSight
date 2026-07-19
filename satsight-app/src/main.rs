@@ -139,6 +139,9 @@ struct App {
     /// Steps advanced per frame while playing.
     speed: u32,
     status: String,
+    /// Whether the "About / legend" help window is open. Starts open so a
+    /// newcomer meets the bidirectional idea and the mark/colour key up front.
+    show_help: bool,
 }
 
 impl App {
@@ -167,6 +170,7 @@ impl App {
             speed: 8,
             status: "Click a cell and type 1–9 to edit. Then Deduce, Full solve, or Step."
                 .to_owned(),
+            show_help: true,
         }
     }
 
@@ -488,6 +492,10 @@ impl App {
             if ui.button("Empty").clicked() {
                 self.load(Sudoku::empty());
             }
+            ui.separator();
+            if ui.button("Help ?").clicked() {
+                self.show_help = !self.show_help;
+            }
         });
 
         ui.horizontal(|ui| {
@@ -575,6 +583,223 @@ impl App {
                 });
             });
     }
+
+    /// A floating "About / legend" window explaining the bidirectional reduction
+    /// this demo visualizes and what every colour and pencil mark means. Opened
+    /// by the "Help ?" button (and on first launch); closable and movable.
+    fn draw_help(&mut self, ctx: &egui::Context) {
+        // The window borrows its own open flag, so copy it out and store it back.
+        let mut open = self.show_help;
+        egui::Window::new("About SatSight — the bidirectional reduction")
+            .open(&mut open)
+            .collapsible(true)
+            .resizable(true)
+            .default_width(460.0)
+            .default_height(560.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, help_body);
+            });
+        self.show_help = open;
+    }
+}
+
+/// The body of the help window: the thesis, the three views, and the full key to
+/// every colour and pencil mark on the grid.
+fn help_body(ui: &mut egui::Ui) {
+    help_thesis(ui);
+    help_views(ui);
+    help_legend(ui);
+    help_editing(ui);
+}
+
+/// The opening "one bridge, two directions" explanation of the reduction.
+fn help_thesis(ui: &mut egui::Ui) {
+    section(ui, "One bridge, two directions");
+    ui.label(
+        "SatSight solves a puzzle by translating it into Boolean SAT and reading \
+         the solver's discoveries back — both directions crossing the same bridge: \
+         a variable registry that is a bijection between puzzle facts (\u{201c}cell \
+         r,c holds the digit v\u{201d}) and SAT variables.",
+    );
+    ui.add_space(4.0);
+    ui.label(
+        "Forward (encoding): the puzzle's rules become fixed CNF, and your givens \
+         enter as assumptions rather than clauses. So editing a clue is cheap \
+         (only the assumptions change, never the rules), and a contradiction points \
+         straight back at the offending clues.",
+    );
+    ui.add_space(4.0);
+    ui.label(
+        "Backward (interpreting): whatever the solver finds \u{2014} forced cells, \
+         surviving candidates, learned relationships, the unsatisfiable core \u{2014} \
+         is decoded through that same registry and painted on the grid in the \
+         puzzle's own language. That round trip is the \u{201c}bidirectional \
+         reduction\u{201d} this demo is about.",
+    );
+}
+
+/// The Deduce / Full solve / Step view descriptions.
+fn help_views(ui: &mut egui::Ui) {
+    section(ui, "The three views");
+    bullet(
+        ui,
+        "Deduce (logic)",
+        "The sound, search-free backward map \u{2014} unit propagation plus \
+         failed-literal probing. It paints only what it can prove from the givens \
+         alone. If it fills the whole board, no search was needed.",
+    );
+    bullet(
+        ui,
+        "Full solve",
+        "Runs the fast BatSat backend to completion and fills every remaining cell. \
+         If the givens contradict, no board is drawn \u{2014} instead the conflicting \
+         clues (the UNSAT core) are flagged.",
+    );
+    bullet(
+        ui,
+        "Step",
+        "Drives the hand-written CDCL search one event at a time, so you can watch it \
+         guess, propagate forced cells, hit conflicts, learn, and backtrack. This is \
+         where the pencil marks and the proven-vs-hypothetical distinction come alive.",
+    );
+}
+
+/// The colour/mark key: placed digits, pencil marks, and highlights.
+fn help_legend(ui: &mut egui::Ui) {
+    let visuals = ui.visuals();
+    let given = visuals.strong_text_color();
+    let full = visuals.weak_text_color();
+    let center = full.gamma_multiply(0.75);
+    let logic = egui::Color32::from_rgb(80, 160, 255);
+    let search = egui::Color32::from_rgb(120, 200, 120);
+    let guess = search.gamma_multiply(0.5);
+    let emphasis = egui::Color32::from_rgb(240, 190, 90);
+    let core = egui::Color32::from_rgb(200, 70, 70);
+
+    section(ui, "Digits (placed values)");
+    legend(ui, given, "given", "the clues you entered.");
+    legend(
+        ui,
+        logic,
+        "logic-proven",
+        "a placement the Deduce map proved from the givens.",
+    );
+    legend(
+        ui,
+        search,
+        "search-proven",
+        "in Step, a cell forced by the givens alone \u{2014} true in every solution \
+         consistent with the clues. Drawn solid, like pen.",
+    );
+    legend(
+        ui,
+        guess,
+        "guess (hypothetical)",
+        "in Step, a cell placed only under the current branching guess \u{2014} it may \
+         be undone on backtrack. Drawn faded, like pencil.",
+    );
+    legend(
+        ui,
+        full,
+        "full-solve",
+        "a cell filled in by the complete BatSat solution.",
+    );
+
+    section(ui, "Pencil marks (Step view)");
+    legend(
+        ui,
+        center,
+        "center marks",
+        "the candidate digits still Boolean-possible in an unsolved cell (the \
+         propagation survivors), laid out as a small 3\u{00d7}3 once the cell narrows.",
+    );
+    legend(
+        ui,
+        guess,
+        "struck center mark",
+        "a candidate the current guess rules out \u{2014} a hypothetical elimination, \
+         drawn struck through. A proven elimination is simply absent: known non-facts \
+         aren't drawn.",
+    );
+    legend(
+        ui,
+        LEARNED_MARK_COLOR,
+        "learned-relationship tint",
+        "a center mark caught in a short clause the solver just learned (see the \
+         Learned panel), e.g. \u{201c}these two cells can't both be 3.\u{201d}",
+    );
+    legend(
+        ui,
+        CORNER_MARK_COLOR,
+        "corner marks",
+        "a digit propagation has confined to just a few cells of a 3\u{00d7}3 box \
+         \u{2014} \u{201c}the 7 goes in one of these cells\u{201d} (a hidden \
+         pair/triple footprint). A digit pinned to one cell is a hidden single and \
+         gets placed instead.",
+    );
+
+    section(ui, "Highlights");
+    legend(
+        ui,
+        emphasis,
+        "amber outline",
+        "the cell(s) the last Step event touched \u{2014} a decision, a propagation, \
+         or the cells of a conflict clause.",
+    );
+    legend(
+        ui,
+        core,
+        "red fill",
+        "conflicting givens named by the UNSAT core, shown when the clues have no \
+         solution.",
+    );
+}
+
+/// The editing keys and the Learned panel explanation, closing the help window.
+fn help_editing(ui: &mut egui::Ui) {
+    section(ui, "Editing & the Learned panel");
+    ui.label(
+        "Click a cell, then type 1\u{2013}9 to set a given, Backspace or 0 to clear, \
+         and the arrow keys to move. Any edit drops the cached results \u{2014} press \
+         Deduce, Full solve, or Step again.",
+    );
+    ui.add_space(4.0);
+    ui.label(
+        "While stepping, the right-hand Learned panel lists the short clauses the \
+         search has discovered, decoded back into the puzzle's language (e.g. \
+         r1c2\u{2260}3 \u{2228} r4c2\u{2260}3). Long, path-dependent clauses are \
+         filtered out to keep it readable.",
+    );
+    ui.add_space(6.0);
+}
+
+/// A bold section heading with a divider, for the help window.
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new(title).strong().size(15.0));
+    ui.separator();
+}
+
+/// A view/term bullet: a bold lead-in followed by its description, wrapped.
+fn bullet(ui: &mut egui::Ui, term: &str, desc: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(egui::RichText::new(format!("{term}:")).strong());
+        ui.label(desc);
+    });
+    ui.add_space(4.0);
+}
+
+/// A legend row: a colour swatch, a bold term, then a wrapped description.
+fn legend(ui: &mut egui::Ui, color: egui::Color32, term: &str, desc: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, color);
+        ui.label(egui::RichText::new(format!("{term} \u{2014}")).strong());
+        ui.label(desc);
+    });
+    ui.add_space(4.0);
 }
 
 /// Draw the 9×9 grid lines, thick every third line to mark the boxes.
@@ -777,6 +1002,7 @@ impl eframe::App for App {
 
         self.draw_status(ctx);
         self.draw_learned_panel(ctx);
+        self.draw_help(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(6.0);

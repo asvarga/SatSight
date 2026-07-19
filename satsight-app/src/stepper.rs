@@ -44,13 +44,6 @@ pub enum Certainty {
     Hypothetical,
 }
 
-/// The most recent short learned clauses to keep for the overlay.
-const LEARNED_KEPT: usize = 16;
-
-/// The longest learned clause worth showing as a "discovered relationship"
-/// (plan §8: raw CDCL clauses are noisy; filter to short, readable ones).
-const LEARNED_MAX_LITS: usize = 3;
-
 /// A value confined by propagation to at most this many cells of a 3×3 box is
 /// surfaced as a corner mark — the footprint of a hidden pair/triple ("one of
 /// these cells"). Wider than that is no hint; a value pinned to a single cell is

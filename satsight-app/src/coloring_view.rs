@@ -14,6 +14,13 @@
 //! candidate-color pips of undecided ones and proven facts apart from hypothetical
 //! ones — exactly the generic [`Stepper`] the Sudoku grid uses, now that it is no
 //! longer Sudoku-shaped.
+//!
+//! Two [`Instance`]s are selectable: the symmetric **Petersen** graph, which
+//! propagation and a little search dispatch easily, and the harder **Dürer** graph
+//! — GP(6,2), the same generalized-Petersen family — which is 3-colorable yet no
+//! local logic settles, so the observable search must genuinely guess, conflict,
+//! and backtrack to solve it. That contrast is the point: Step the Dürer graph to
+//! see the CDCL work for its answer.
 
 use std::f32::consts::PI;
 
@@ -56,8 +63,55 @@ enum Overlay {
     Step,
 }
 
+/// The selectable graph instances. Both are generalized Petersen graphs with a
+/// three-color budget, so the palette and legend never change; they differ only
+/// in how hard the solver has to work.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Instance {
+    /// GP(5,2): highly symmetric, dispatched with little search.
+    Petersen,
+    /// GP(6,2), the Dürer graph: 3-colorable but not by local logic — the Step
+    /// view has to guess, conflict, and backtrack (issue: a harder instance).
+    Durer,
+}
+
+impl Instance {
+    /// The tab label for the graph switcher.
+    fn label(self) -> &'static str {
+        match self {
+            Instance::Petersen => "Petersen",
+            Instance::Durer => "Dürer",
+        }
+    }
+
+    /// The graph and its concentric layout.
+    fn build(self) -> (GraphColoring, Vec<egui::Pos2>) {
+        match self {
+            Instance::Petersen => petersen(),
+            Instance::Durer => durer(),
+        }
+    }
+
+    /// The opening status line describing this instance.
+    fn blurb(self) -> &'static str {
+        match self {
+            Instance::Petersen => {
+                "The Petersen graph, 3 colors. Click a vertex to cycle its color, then \
+                 Deduce, Full solve, Backbone, or Step."
+            }
+            Instance::Durer => {
+                "The Dürer graph GP(6,2), 3 colors — 3-colorable, but no local logic \
+                 settles it. Press Step (or Play) to watch the search guess, hit a \
+                 conflict, learn, and backtrack its way to a coloring."
+            }
+        }
+    }
+}
+
 /// The graph-coloring view: a fixed graph, its layout, and cached backward maps.
 pub struct ColoringView {
+    /// Which graph instance is on screen (drives the switcher's selection).
+    instance: Instance,
     puzzle: GraphColoring,
     /// Per-vertex layout position, normalized to `[0, 1]²`.
     positions: Vec<egui::Pos2>,
@@ -84,13 +138,18 @@ pub struct ColoringView {
 }
 
 impl ColoringView {
-    /// A fresh view over the Petersen graph with a budget of three colors — the
-    /// classic 3-chromatic instance, tight enough that pinning a couple of vertices
-    /// forces others (good for watching deduction) yet symmetric enough to have
-    /// many colorings (so the backbone has something to say).
+    /// A fresh view over the Petersen graph — the classic 3-chromatic instance,
+    /// symmetric enough to have many colorings (so the backbone has something to
+    /// say). Switch to the Dürer graph for one that needs real search.
     #[must_use]
     pub fn new() -> Self {
-        let (puzzle, positions) = petersen();
+        Self::from_instance(Instance::Petersen)
+    }
+
+    /// Build the view for a given graph instance: encode its rules once (the graph
+    /// never changes, only the color givens do) and load both solver backends.
+    fn from_instance(instance: Instance) -> Self {
+        let (puzzle, positions) = instance.build();
         let mut reg = Registry::new();
         let mut cnf = Cnf::new();
         puzzle.encode_rules(&mut reg, &mut cnf);
@@ -98,6 +157,7 @@ impl ColoringView {
         batsat.load_rules(&cnf);
         let cdcl = Cdcl::from_cnf(&cnf);
         Self {
+            instance,
             puzzle,
             positions,
             reg,
@@ -110,10 +170,17 @@ impl ColoringView {
             stepper: None,
             core: Vec::new(),
             speed: 8,
-            status: "The Petersen graph, 3 colors. Click a vertex to cycle its color, \
-                     then Deduce, Full solve, Backbone, or Step."
-                .to_owned(),
+            status: instance.blurb().to_owned(),
         }
+    }
+
+    /// Switch to a different graph instance, rebuilding its rules and dropping
+    /// every cached result. Each graph has its own encoding, so the registry and
+    /// both solvers are rebuilt; the play speed carries over.
+    fn load(&mut self, instance: Instance) {
+        let speed = self.speed;
+        *self = Self::from_instance(instance);
+        self.speed = speed;
     }
 
     /// Drop cached results after an edit and stop overlaying them.
@@ -334,6 +401,65 @@ impl ColoringView {
         })
     }
 
+    /// The top control bar: graph switcher, the backward-map buttons, and the
+    /// stepping controls.
+    fn draw_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Graph:");
+            let mut chosen = self.instance;
+            for inst in [Instance::Petersen, Instance::Durer] {
+                ui.selectable_value(&mut chosen, inst, inst.label());
+            }
+            if chosen != self.instance {
+                self.load(chosen);
+            }
+            ui.separator();
+            ui.label(format!("{} colors available", self.puzzle.n_colors()));
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Deduce (logic)").clicked() {
+                self.run_logic();
+            }
+            if ui.button("Full solve").clicked() {
+                self.run_full();
+            }
+            if ui
+                .button("Backbone")
+                .on_hover_text("Colors that hold in every proper coloring of the graph.")
+                .clicked()
+            {
+                self.run_backbone();
+            }
+            ui.separator();
+            if ui.button("Clear givens").clicked() {
+                self.clear();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Step the CDCL:");
+            if ui.button("Step ▶").clicked() {
+                self.step_once();
+            }
+            let playing = self.stepper.as_ref().is_some_and(|st| st.playing);
+            let done = self.stepper.as_ref().is_some_and(Stepper::is_done);
+            if ui
+                .button(if playing { "Pause ⏸" } else { "Play ⏵" })
+                .clicked()
+            {
+                if self.stepper.is_none() || done {
+                    self.start_stepper();
+                }
+                if let Some(st) = &mut self.stepper {
+                    st.playing = !st.playing;
+                }
+            }
+            if ui.button("Restart ⟲").clicked() {
+                self.start_stepper();
+            }
+            ui.add(egui::Slider::new(&mut self.speed, 1..=200).text("steps/frame"));
+        });
+    }
+
     /// Render the whole view: controls, the graph, and the status/legend bar.
     pub fn ui(&mut self, ctx: &egui::Context) {
         // Advance a playing stepper N steps this frame, then keep the UI live.
@@ -358,49 +484,7 @@ impl ColoringView {
 
         egui::TopBottomPanel::top("coloring_controls").show(ctx, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("Deduce (logic)").clicked() {
-                    self.run_logic();
-                }
-                if ui.button("Full solve").clicked() {
-                    self.run_full();
-                }
-                if ui
-                    .button("Backbone")
-                    .on_hover_text("Colors that hold in every proper coloring of the graph.")
-                    .clicked()
-                {
-                    self.run_backbone();
-                }
-                ui.separator();
-                if ui.button("Clear givens").clicked() {
-                    self.clear();
-                }
-                ui.label(format!("{} colors available", self.puzzle.n_colors()));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Step the CDCL:");
-                if ui.button("Step ▶").clicked() {
-                    self.step_once();
-                }
-                let playing = self.stepper.as_ref().is_some_and(|st| st.playing);
-                let done = self.stepper.as_ref().is_some_and(Stepper::is_done);
-                if ui
-                    .button(if playing { "Pause ⏸" } else { "Play ⏵" })
-                    .clicked()
-                {
-                    if self.stepper.is_none() || done {
-                        self.start_stepper();
-                    }
-                    if let Some(st) = &mut self.stepper {
-                        st.playing = !st.playing;
-                    }
-                }
-                if ui.button("Restart ⟲").clicked() {
-                    self.start_stepper();
-                }
-                ui.add(egui::Slider::new(&mut self.speed, 1..=200).text("steps/frame"));
-            });
+            self.draw_controls(ui);
             ui.add_space(4.0);
         });
 
@@ -611,6 +695,34 @@ fn petersen() -> (GraphColoring, Vec<egui::Pos2>) {
     (g, positions)
 }
 
+/// The Dürer graph — the generalized Petersen graph GP(6,2) — and its concentric
+/// layout: an outer hexagon, an inner hexagram (two triangles, the inner ring
+/// stepping by two), joined by spokes. Same family as the Petersen graph (GP(5,2))
+/// but a genuine step up: it is 3-colorable, yet no local logic settles it, so the
+/// observable search has to guess, conflict, and backtrack to color it — which is
+/// what makes it a good Step-view demo.
+fn durer() -> (GraphColoring, Vec<egui::Pos2>) {
+    let mut g = GraphColoring::new(12, 3);
+    for i in 0..6 {
+        g.add_edge(i, (i + 1) % 6); // outer hexagon
+        g.add_edge(i, i + 6); // spoke
+        g.add_edge(6 + i, 6 + (i + 2) % 6); // inner hexagram (two triangles)
+    }
+    let center = egui::pos2(0.5, 0.5);
+    let ring = |r: f32, i: usize| {
+        let a = -PI / 2.0 + (i as f32) * 2.0 * PI / 6.0;
+        center + egui::vec2(r * a.cos(), r * a.sin())
+    };
+    let mut positions = Vec::with_capacity(12);
+    for i in 0..6 {
+        positions.push(ring(0.42, i));
+    }
+    for i in 0..6 {
+        positions.push(ring(0.22, i));
+    }
+    (g, positions)
+}
+
 /// A small colored swatch + label, for the status legend.
 fn swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
@@ -701,11 +813,11 @@ fn color_name(c: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{color_name, step_core_vertices};
+    use super::{color_name, step_core_vertices, Instance};
     use crate::stepper::{Certainty, Stepper};
-    use satsight_core::{Cdcl, Cnf, Registry};
+    use satsight_core::{Cdcl, Cnf, Event, Registry};
     use satsight_puzzles::coloring::{GraphColoring, VertexColor};
-    use satsight_puzzles::Puzzle;
+    use satsight_puzzles::{deduce, solve, Puzzle};
 
     /// Encode `g`'s rules and start a stepped search over its pre-colorings —
     /// exactly what [`ColoringView::start_stepper`](super::ColoringView) does.
@@ -783,5 +895,47 @@ mod tests {
         assert_eq!(color_name(2), "blue");
         // Beyond the named palette, fall back to a numeric label.
         assert_eq!(color_name(9), "color 9");
+    }
+
+    #[test]
+    fn durer_graph_is_solvable_but_needs_search() {
+        // The harder instance (GP(6,2), the Dürer graph): it is 3-colorable, yet
+        // no local logic settles it — so the observable CDCL must genuinely branch
+        // and backtrack. Assert both, so the Step-view demo can't silently regress
+        // into something propagation solves outright.
+        let (g, positions) = Instance::Durer.build();
+        assert_eq!(g.n_vertices(), 12);
+        assert_eq!(positions.len(), 12);
+        assert!(solve(&g).is_some(), "the Dürer graph is 3-colorable");
+        // Pure logic (propagation + probing, no givens) proves nothing here.
+        assert!(
+            deduce(&g).proven.iter().all(|(_, holds)| !holds),
+            "no vertex is forced by logic alone"
+        );
+
+        // Drive the same stepper the UI drives, counting real search.
+        let mut st = stepper_for(&g);
+        let (mut conflicts, mut backtracks) = (0u32, 0u32);
+        let mut guard = 0;
+        while !st.is_done() {
+            if let Some(event) = {
+                st.step();
+                st.last_event()
+            } {
+                match event {
+                    Event::Conflict { .. } => conflicts += 1,
+                    Event::Backtrack { .. } => backtracks += 1,
+                    _ => {}
+                }
+            }
+            guard += 1;
+            assert!(guard < 1_000_000, "the search must terminate");
+        }
+        assert!(st.is_solved(), "the search finds a coloring");
+        assert!(
+            conflicts > 0 && backtracks > 0,
+            "coloring it takes real backtracking search: conflicts={conflicts} \
+             backtracks={backtracks}"
+        );
     }
 }

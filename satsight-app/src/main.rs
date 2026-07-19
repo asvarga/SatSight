@@ -30,7 +30,7 @@
 mod stepper;
 
 use eframe::egui;
-use satsight_core::{BatSatBackend, Cdcl, Cnf, Registry, SolveOutcome, Solver};
+use satsight_core::{clause, BatSatBackend, Cdcl, Cnf, Lit, Registry, SolveOutcome, Solver};
 use satsight_puzzles::sudoku::{Cell, LogicReport, Sudoku, SudokuCell};
 use satsight_puzzles::{deduce, Grid, Puzzle};
 
@@ -124,6 +124,16 @@ struct App {
     cdcl: Cdcl,
     /// The fast backend for "Full solve" (plan §5).
     batsat: BatSatBackend,
+    /// The working SAT problem the solvers run on: the immutable `rules` plus any
+    /// blocking clauses added by "Block solution". `cdcl` and `batsat` are rebuilt
+    /// from it whenever it changes.
+    cnf: Cnf,
+    /// The pristine rule CNF, kept so an edit can reset `cnf` to rules-only and
+    /// drop every blocking clause (they name a solution of the *old* board).
+    rules: Cnf,
+    /// How many distinct solutions have been blocked out (negated into `cnf`). Zero
+    /// unless the user has pressed "Block solution"; drives the uniqueness verdict.
+    blocked: usize,
 
     overlay: Overlay,
     /// Givens + logic-proven placements, or `None` until "Deduce" is pressed.
@@ -150,6 +160,7 @@ impl App {
         let mut reg = Registry::new();
         let mut cnf = Cnf::new();
         Sudoku::empty().encode_rules(&mut reg, &mut cnf);
+        let rules = cnf.clone();
         let cdcl = Cdcl::from_cnf(&cnf);
         let mut batsat = BatSatBackend::new();
         batsat.load_rules(&cnf);
@@ -160,6 +171,9 @@ impl App {
             reg,
             cdcl,
             batsat,
+            cnf,
+            rules,
+            blocked: 0,
             overlay: Overlay::None,
             logic: None,
             report: None,
@@ -189,6 +203,66 @@ impl App {
         self.full = None;
         self.stepper = None;
         self.core.clear();
+        // Blocking clauses name a full solution of the board that just changed, so
+        // they no longer mean anything — reset the SAT problem to the pure rules.
+        if self.blocked > 0 {
+            self.cnf = self.rules.clone();
+            self.rebuild_solvers();
+            self.blocked = 0;
+        }
+    }
+
+    /// Rebuild the CDCL and BatSat solvers from the current working `cnf`, after a
+    /// blocking clause is added or removed. Cheap (the rule CNF is small) and only
+    /// happens on a button press or an edit, never per frame.
+    fn rebuild_solvers(&mut self) {
+        self.cdcl = Cdcl::from_cnf(&self.cnf);
+        self.batsat = BatSatBackend::new();
+        self.batsat.load_rules(&self.cnf);
+    }
+
+    /// Add the negation of the fully-solved board to the SAT problem, so the next
+    /// search must find a *different* solution — or prove there is none, which
+    /// means the board is unique. A no-op (with a nudge) unless the stepper has
+    /// actually reached a full solution.
+    ///
+    /// This is Option 1 of the uniqueness story: the board is unique iff, after
+    /// blocking the solution just found, re-solving is UNSAT. The user drives it:
+    /// Play to a solution, Block it, Play again.
+    fn block_current_solution(&mut self) {
+        if !self.stepper.as_ref().is_some_and(Stepper::is_solved) {
+            self.status = String::from("Play (or Step) to a full solution first, then block it.");
+            return;
+        }
+        // Read the placed digits out before mutating self (ends the stepper borrow).
+        let placements: Vec<(usize, usize, u8)> = {
+            let st = self.stepper.as_ref().expect("is_solved implies a stepper");
+            (0..9)
+                .flat_map(|r| (0..9).map(move |c| (r, c)))
+                .filter_map(|(r, c)| st.placed(r, c).map(|v| (r, c, v)))
+                .collect()
+        };
+        // The no-good: ¬(all these placements hold) = the OR of their negations.
+        // Any different full solution flips at least one placed cell, satisfying it.
+        let lits: Vec<Lit> = placements
+            .into_iter()
+            .filter_map(|(r, c, v)| {
+                self.reg
+                    .get(&Cell { r, c, v })
+                    .map(satsight_core::Var::neg_lit)
+            })
+            .collect();
+        self.cnf.add_clause(clause(lits));
+        self.blocked += 1;
+        self.rebuild_solvers();
+        // Drop the finished search; the board falls back to just the givens until
+        // the next Play launches a fresh search against the augmented problem.
+        self.stepper = None;
+        self.status = format!(
+            "Blocked solution #{}. Play again — another solution means the board isn't \
+             unique; UNSAT (no solution) means it is.",
+            self.blocked
+        );
     }
 
     /// Set or clear the given at the selected cell, invalidating results.
@@ -515,6 +589,17 @@ impl App {
             if ui.button("Restart ⟲").clicked() {
                 self.start_stepper();
             }
+            let solved = self.stepper.as_ref().is_some_and(Stepper::is_solved);
+            if ui
+                .add_enabled(solved, egui::Button::new("Block solution ✂"))
+                .on_hover_text(
+                    "Add ¬(this board) to the SAT problem, then Play again: another \
+                     solution means the board isn't unique; UNSAT means it is.",
+                )
+                .clicked()
+            {
+                self.block_current_solution();
+            }
             ui.add(egui::Slider::new(&mut self.speed, 1..=200).text("steps/frame"));
         });
     }
@@ -539,6 +624,25 @@ impl App {
             // In Step mode the status tracks the live event; otherwise the last
             // action's summary.
             let line = match (self.overlay, &self.stepper) {
+                // After blocking, a finished search delivers the uniqueness verdict
+                // rather than the raw event (whose "these givens have no solution"
+                // would misread — the givens do have one; there's just no *other*).
+                (Overlay::Step, Some(st)) if self.blocked > 0 && st.is_done() => {
+                    if st.is_solved() {
+                        format!(
+                            "A distinct solution #{} — the board is NOT unique. Block it \
+                             too, then Play, to look for more.",
+                            self.blocked + 1
+                        )
+                    } else if self.blocked == 1 {
+                        "No other solution exists — the board is unique. \u{2713}".to_owned()
+                    } else {
+                        format!(
+                            "No further solutions — the board has exactly {} of them.",
+                            self.blocked
+                        )
+                    }
+                }
                 (Overlay::Step, Some(st)) => st.description(),
                 _ => self.status.clone(),
             };
@@ -624,6 +728,15 @@ fn help_views(ui: &mut egui::Ui) {
         "Drives the hand-written CDCL search one event at a time, so you can watch it \
          guess, propagate forced cells, hit conflicts, learn, and backtrack. This is \
          where the pencil marks and the proven-vs-hypothetical distinction come alive.",
+    );
+    bullet(
+        ui,
+        "Block solution",
+        "The search stops at the first solution it finds \u{2014} it doesn't prove that \
+         solution is the only one. To check: Play to a full solution, press Block \
+         solution (which adds \u{00ac}(this board) to the SAT problem), then Play again. \
+         A second solution means the puzzle is ambiguous; UNSAT means it was unique. \
+         Editing any given clears the blocks.",
     );
 }
 

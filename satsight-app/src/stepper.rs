@@ -87,6 +87,15 @@ impl Stepper {
         self.search.is_done()
     }
 
+    /// Whether the search finished by *finding a solution* (SAT), as opposed to
+    /// proving none exists (UNSAT) or still running. True exactly when the last
+    /// event was [`Event::Sat`] — the signal that the board is fully placed and
+    /// its negation can be blocked to hunt for a second solution.
+    #[must_use]
+    pub fn is_solved(&self) -> bool {
+        matches!(self.last, Some(Event::Sat))
+    }
+
     /// The digit the search currently forces in cell `(r, c)`, if any.
     #[must_use]
     pub fn placed(&self, r: usize, c: usize) -> Option<u8> {
@@ -275,7 +284,7 @@ fn box_corner_marks(box_candidates: &[[bool; 9]; 9]) -> [[bool; 9]; 9] {
 #[cfg(test)]
 mod tests {
     use super::{Certainty, Stepper};
-    use satsight_core::{Cdcl, Cnf, Registry};
+    use satsight_core::{clause, Assignment, Cdcl, Clause, Cnf, Registry, SolveOutcome};
     use satsight_puzzles::sudoku::{Cell, Sudoku};
     use satsight_puzzles::Puzzle;
 
@@ -292,6 +301,25 @@ mod tests {
         let assumptions = puzzle.assumptions(&reg);
         let cdcl = Cdcl::from_cnf(&cnf);
         Stepper::new(&cdcl, reg, &assumptions)
+    }
+
+    /// The app's "Block solution" no-good: `¬(every placed cell of `model`)`, the
+    /// OR of the negations of the true cell-propositions. Any *different* full
+    /// board flips at least one of them, so this forbids exactly `model`.
+    fn block_model(reg: &Registry<Cell>, model: &Assignment) -> Clause {
+        let mut lits = Vec::new();
+        for r in 0..9 {
+            for c in 0..9 {
+                for v in 1..=9u8 {
+                    if let Some(var) = reg.get(&Cell { r, c, v }) {
+                        if model.var_value(var) == Some(true) {
+                            lits.push(var.neg_lit());
+                        }
+                    }
+                }
+            }
+        }
+        clause(lits)
     }
 
     #[test]
@@ -479,5 +507,72 @@ mod tests {
             assert_eq!(r, 0);
             assert!(c == 0 || c == 1);
         }
+    }
+
+    #[test]
+    fn blocking_the_unique_solution_makes_the_search_unsat() {
+        // The mechanism behind the "Block solution" button: the observable CDCL
+        // stops at the first model, so to *prove* uniqueness we add ¬(that board)
+        // and re-solve. A uniquely-solvable puzzle then comes back UNSAT — the
+        // search has proven there is no second solution.
+        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
+        let mut reg: Registry<Cell> = Registry::new();
+        let mut cnf = Cnf::new();
+        puzzle.encode_rules(&mut reg, &mut cnf);
+        let assumptions = puzzle.assumptions(&reg);
+
+        let cdcl = Cdcl::from_cnf(&cnf);
+        let SolveOutcome::Sat(model) = cdcl.search(&assumptions).run() else {
+            panic!("the sample puzzle is satisfiable");
+        };
+        // The blocked board must be the known unique solution.
+        let sol = SOLUTION.as_bytes();
+        for r in 0..9 {
+            for c in 0..9 {
+                let v = sol[r * 9 + c] - b'0';
+                let var = reg.get(&Cell { r, c, v }).unwrap();
+                assert_eq!(model.var_value(var), Some(true));
+            }
+        }
+
+        cnf.add_clause(block_model(&reg, &model));
+        let cdcl = Cdcl::from_cnf(&cnf);
+        assert!(
+            matches!(cdcl.search(&assumptions).run(), SolveOutcome::Unsat(_)),
+            "blocking the unique solution must leave the puzzle UNSAT"
+        );
+    }
+
+    #[test]
+    fn blocking_one_of_many_solutions_yields_a_different_one() {
+        // The other verdict: an empty board has many solutions, so blocking the
+        // first still leaves the problem SAT — and the second model differs from
+        // the first in at least one cell (that is what the no-good forces).
+        let puzzle = Sudoku::empty();
+        let mut reg: Registry<Cell> = Registry::new();
+        let mut cnf = Cnf::new();
+        puzzle.encode_rules(&mut reg, &mut cnf);
+        let assumptions = puzzle.assumptions(&reg);
+
+        let cdcl = Cdcl::from_cnf(&cnf);
+        let SolveOutcome::Sat(first) = cdcl.search(&assumptions).run() else {
+            panic!("an empty board is satisfiable");
+        };
+
+        cnf.add_clause(block_model(&reg, &first));
+        let cdcl = Cdcl::from_cnf(&cnf);
+        let SolveOutcome::Sat(second) = cdcl.search(&assumptions).run() else {
+            panic!("an empty board has more than one solution");
+        };
+
+        let differs = (0..9)
+            .flat_map(|r| (0..9).map(move |c| (r, c)))
+            .any(|(r, c)| {
+                (1..=9u8).any(|v| {
+                    let var = reg.get(&Cell { r, c, v }).unwrap();
+                    first.var_value(var) != second.var_value(var)
+                })
+            });
+        assert!(differs, "the blocked board must not reappear");
     }
 }

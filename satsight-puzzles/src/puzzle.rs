@@ -13,8 +13,9 @@
 
 use std::hash::Hash;
 
+use satsight_core::backbone::backbone as core_backbone;
 use satsight_core::backend_batsat::BatSatBackend;
-use satsight_core::cnf::{Cnf, Lit, Var};
+use satsight_core::cnf::{clause, var_count, Cnf, Lit, Var};
 use satsight_core::propagate::Propagator;
 use satsight_core::registry::Registry;
 use satsight_core::solver::{SolveOutcome, Solver};
@@ -189,6 +190,94 @@ pub fn deduce<P: Puzzle>(puzzle: &P) -> Deductions<P::Var> {
             }
         }
     }
+    Deductions {
+        satisfiable: true,
+        proven,
+    }
+}
+
+/// The **backbone** of `puzzle`: every fact that holds in *every* solution
+/// consistent with the givens, decoded into the puzzle's own language (plan §1).
+///
+/// Reuses the [`Deductions`] shape — the read model is the same regardless of
+/// *how* a fact was proven — but the route differs from [`deduce`]: where
+/// `deduce` proves facts by sound-but-incomplete propagation (no search),
+/// `backbone` proves them by exhaustive all-solutions reasoning. It is therefore
+/// a *superset* of `deduce`'s facts, and reveals cells forced across every
+/// solution that no local deduction can reach. On a uniquely solvable board the
+/// backbone is the whole solution; on an under-constrained one it is exactly the
+/// cells that never vary. Givens are excluded (they are trivially backbone).
+///
+/// Generic over every [`Puzzle`] — the same [`satsight_core::backbone`] core
+/// function drives Sudoku and graph coloring alike.
+///
+/// Cost: a **uniqueness fast-path** (block the found model, re-solve) collapses
+/// the common uniquely-solvable case to two solves; only genuinely ambiguous
+/// boards fall back to the general per-literal model rotation.
+#[must_use]
+pub fn backbone<P: Puzzle>(puzzle: &P) -> Deductions<P::Var> {
+    let mut reg = Registry::new();
+    let mut cnf = Cnf::new();
+    puzzle.encode_rules(&mut reg, &mut cnf);
+    let givens = puzzle.assumptions(&reg);
+
+    let mut backend = BatSatBackend::new();
+    backend.load_rules(&cnf);
+
+    // The seed solve doubles as the satisfiability check.
+    let seed = match backend.solve(&givens) {
+        SolveOutcome::Sat(model) => model,
+        SolveOutcome::Unsat(_) => {
+            return Deductions {
+                satisfiable: false,
+                proven: Vec::new(),
+            };
+        }
+    };
+
+    let n = var_count(&cnf);
+    let var_at = |i: usize| Var::new(u32::try_from(i).expect("variable index fits in u32"));
+    let model_lit = |i: usize| {
+        seed.var_value(var_at(i)).map(|value| {
+            if value {
+                var_at(i).pos_lit()
+            } else {
+                var_at(i).neg_lit()
+            }
+        })
+    };
+
+    // Uniqueness fast-path: block the seed (¬ of its full assignment) and re-solve.
+    // UNSAT means it is the only solution, so the backbone is the entire model and
+    // no per-literal rotation is needed — the common case for a real puzzle.
+    let block: Vec<Lit> = (0..n)
+        .filter_map(|i| model_lit(i).map(|lit| !lit))
+        .collect();
+    let mut blocked_cnf = cnf.clone();
+    blocked_cnf.add_clause(clause(block));
+    let mut blocked_backend = BatSatBackend::new();
+    blocked_backend.load_rules(&blocked_cnf);
+
+    let literals: Vec<Lit> = match blocked_backend.solve(&givens) {
+        SolveOutcome::Unsat(_) => (0..n).filter_map(model_lit).collect(),
+        // Genuinely ambiguous: compute the exact backbone by model rotation.
+        SolveOutcome::Sat(_) => core_backbone(&mut backend, &givens).unwrap_or_default(),
+    };
+
+    // Decode every backbone literal, dropping the givens (trivially backbone) and
+    // any auxiliary variables (which the registry decodes as `None`).
+    let mut is_given = vec![false; reg.len()];
+    for g in &givens {
+        if let Some(slot) = is_given.get_mut(g.var().idx()) {
+            *slot = true;
+        }
+    }
+    let proven = literals
+        .iter()
+        .filter(|lit| !is_given.get(lit.var().idx()).copied().unwrap_or(false))
+        .filter_map(|&lit| reg.decode(lit))
+        .collect();
+
     Deductions {
         satisfiable: true,
         proven,

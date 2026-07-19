@@ -23,7 +23,7 @@ use satsight_core::encodings::exactly_one_pairwise;
 use satsight_core::registry::Registry;
 use satsight_core::view::SolverView;
 
-use crate::puzzle::{Grid, Puzzle};
+use crate::puzzle::{Deductions, Grid, Puzzle};
 
 /// A graph-coloring proposition: "vertex `vertex` takes color `color`" (the
 /// reduction's vocabulary). `vertex` is `0..n_vertices`, `color` is `0..n_colors`.
@@ -99,6 +99,49 @@ impl GraphColoring {
     pub fn color_at(grid: &Grid<ColoringCell>, vertex: usize) -> Option<usize> {
         grid.get(0, vertex).color
     }
+
+    /// The number of vertices.
+    #[must_use]
+    pub fn n_vertices(&self) -> usize {
+        self.n_vertices
+    }
+
+    /// The color budget.
+    #[must_use]
+    pub fn n_colors(&self) -> usize {
+        self.n_colors
+    }
+
+    /// The undirected edges, each as `(u, w)` with `u < w`.
+    #[must_use]
+    pub fn edges(&self) -> &[(usize, usize)] {
+        &self.edges
+    }
+
+    /// The pre-colored (given) color of `vertex`, if any.
+    #[must_use]
+    pub fn fixed(&self, vertex: usize) -> Option<usize> {
+        self.fixed[vertex]
+    }
+
+    /// A grid showing only what a set of [`Deductions`] proves: pre-colorings plus
+    /// forced colors, with still-undetermined vertices left blank. Mirrors
+    /// [`Sudoku::project_deductions`](crate::sudoku::Sudoku::project_deductions),
+    /// so the frontend renders logic and backbone results the same way it renders a
+    /// full solution.
+    #[must_use]
+    pub fn project_deductions(&self, deductions: &Deductions<VertexColor>) -> Grid<ColoringCell> {
+        let mut colors: Vec<Option<usize>> = self.fixed.clone();
+        for (vc, holds) in &deductions.proven {
+            if *holds {
+                colors[vc.vertex] = Some(vc.color);
+            }
+        }
+        Grid::from_fn(1, self.n_vertices, |_, vertex| ColoringCell {
+            color: colors[vertex],
+            fixed: self.fixed[vertex].is_some(),
+        })
+    }
 }
 
 impl Puzzle for GraphColoring {
@@ -159,7 +202,7 @@ impl Puzzle for GraphColoring {
 #[cfg(test)]
 mod tests {
     use super::{ColoringCell, GraphColoring, VertexColor};
-    use crate::puzzle::{deduce, solve, Grid, Puzzle};
+    use crate::puzzle::{backbone, deduce, solve, Grid, Puzzle};
     use satsight_core::cdcl::Cdcl;
     use satsight_core::cnf::Cnf;
     use satsight_core::registry::Registry;
@@ -240,6 +283,57 @@ mod tests {
             }
             _ => panic!("CDCL and BatSat disagree on the coloring instance"),
         }
+    }
+
+    #[test]
+    fn backbone_distinguishes_forced_facts_from_free_choices() {
+        // K3, three colors, only vertex 0 pinned to color 0: vertices 1 and 2 swap
+        // between the two colorings, so neither is forced to a *specific* color —
+        // yet color 0 is ruled out for both in *every* coloring (they neighbor v0).
+        // The backbone must capture those forced eliminations but no free placement.
+        let mut g = GraphColoring::complete(3, 3);
+        g.fix(0, Some(0));
+        let bb = backbone(&g);
+        assert!(bb.satisfiable);
+        assert!(bb.proven.contains(&(
+            VertexColor {
+                vertex: 1,
+                color: 0
+            },
+            false
+        )));
+        assert!(bb.proven.contains(&(
+            VertexColor {
+                vertex: 2,
+                color: 0
+            },
+            false
+        )));
+        assert!(
+            !bb.proven
+                .iter()
+                .any(|(vc, holds)| *holds && (vc.vertex == 1 || vc.vertex == 2)),
+            "v1 and v2 are free, so no positive placement is in the backbone"
+        );
+    }
+
+    #[test]
+    fn backbone_captures_a_forced_vertex() {
+        // Pin two of the triangle to distinct colors: the third is forced in every
+        // coloring (there is only one), so the backbone includes its placement —
+        // the same conclusion `deduce` reaches, via all-solutions reasoning.
+        let mut g = GraphColoring::complete(3, 3);
+        g.fix(0, Some(0));
+        g.fix(1, Some(1));
+        let bb = backbone(&g);
+        assert!(bb.satisfiable);
+        assert!(bb.proven.contains(&(
+            VertexColor {
+                vertex: 2,
+                color: 2
+            },
+            true
+        )));
     }
 
     #[test]

@@ -27,13 +27,15 @@
     clippy::cast_sign_loss
 )]
 
+mod coloring_view;
 mod stepper;
 
 use eframe::egui;
 use satsight_core::{clause, BatSatBackend, Cdcl, Cnf, Lit, Registry, SolveOutcome, Solver};
 use satsight_puzzles::sudoku::{Cell, LogicReport, Sudoku, SudokuCell};
-use satsight_puzzles::{deduce, Grid, Puzzle};
+use satsight_puzzles::{backbone, deduce, Grid, Puzzle};
 
+use coloring_view::{ColoringView, BACKBONE_COLOR};
 use stepper::{Certainty, Emphasis, Stepper};
 
 /// Box-confined candidates: digits propagation has cornered into a few cells of a
@@ -87,6 +89,14 @@ fn main() {
     });
 }
 
+/// Which puzzle the demo is showing. Sudoku is the primary, rich view; graph
+/// coloring (plan §7) proves the same abstractions drive a non-grid puzzle.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PuzzleKind {
+    Sudoku,
+    Coloring,
+}
+
 /// Which decoded artifact the grid is currently painting over the givens.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Overlay {
@@ -96,6 +106,8 @@ enum Overlay {
     Logic,
     /// The complete model from the full solve.
     Full,
+    /// Cells forced across *every* solution (the backbone, plan §1).
+    Backbone,
     /// The live state of the stepped CDCL search.
     Step,
 }
@@ -105,6 +117,8 @@ enum Source {
     Given,
     Logic,
     Full,
+    /// A cell forced in every solution consistent with the givens (the backbone).
+    Backbone,
     /// Placed by the stepped search and entailed by the givens alone — a proven
     /// fact (plan §1), drawn solid.
     SearchProven,
@@ -116,6 +130,12 @@ enum Source {
 /// The application state. Rules are encoded once (they never change); solver
 /// outputs are cached and invalidated on edit.
 struct App {
+    /// Which puzzle is on screen. The Sudoku state below is always live; the
+    /// coloring view keeps its own self-contained state.
+    kind: PuzzleKind,
+    /// The second-puzzle view (graph coloring), driven by the same generic maps.
+    coloring: ColoringView,
+
     puzzle: Sudoku,
     selected: Option<(usize, usize)>,
     /// The forward encoding, built once: the registry (bridge) and a CDCL holding
@@ -141,6 +161,8 @@ struct App {
     report: Option<LogicReport>,
     /// The full solution, or `None` until "Full solve" is pressed.
     full: Option<Grid<SudokuCell>>,
+    /// Givens + cells forced across every solution, or `None` until "Backbone".
+    backbone: Option<Grid<SudokuCell>>,
     /// The live stepped search, or `None` until "Step"/"Play" is pressed.
     stepper: Option<Stepper>,
     /// Given cells named by an UNSAT core, to flag in red (plan §4).
@@ -166,6 +188,8 @@ impl App {
         batsat.load_rules(&cnf);
 
         Self {
+            kind: PuzzleKind::Sudoku,
+            coloring: ColoringView::new(),
             puzzle: Sudoku::hard_sample(),
             selected: None,
             reg,
@@ -178,6 +202,7 @@ impl App {
             logic: None,
             report: None,
             full: None,
+            backbone: None,
             stepper: None,
             core: Vec::new(),
             speed: 8,
@@ -201,6 +226,7 @@ impl App {
         self.logic = None;
         self.report = None;
         self.full = None;
+        self.backbone = None;
         self.stepper = None;
         self.core.clear();
         // Blocking clauses name a full solution of the board that just changed, so
@@ -300,6 +326,41 @@ impl App {
         self.core.clear();
     }
 
+    /// Run the backbone: cells forced across *every* solution (plan §1).
+    ///
+    /// On a uniquely solvable board this is the whole solution; on an
+    /// under-constrained one it is exactly the cells that never vary — the
+    /// interesting case, which the status line points the user toward.
+    fn run_backbone(&mut self) {
+        let bb = backbone(&self.puzzle);
+        if bb.satisfiable {
+            let report = self.puzzle.logic_report_from(&bb);
+            let solved = report.solved_cells();
+            self.status = if solved == 81 {
+                format!(
+                    "Backbone = the whole board: these {} givens have a unique solution. \
+                     Delete a given to reveal cells that vary between solutions.",
+                    report.givens,
+                )
+            } else {
+                format!(
+                    "Backbone: {} of the open cells are forced in every solution; {} still vary. \
+                     ({} eliminations forced across all solutions.)",
+                    report.placements.len(),
+                    81 - solved,
+                    report.eliminations,
+                )
+            };
+            self.backbone = Some(self.puzzle.project_deductions(&bb));
+        } else {
+            self.backbone = None;
+            self.status =
+                String::from("These givens contradict — no solutions, so no backbone (UNSAT).");
+        }
+        self.overlay = Overlay::Backbone;
+        self.core.clear();
+    }
+
     /// Run the full BatSat solve, flagging the conflicting givens on UNSAT.
     fn run_full(&mut self) {
         let assumptions = self.puzzle.assumptions(&self.reg);
@@ -376,6 +437,11 @@ impl App {
                 .as_ref()
                 .and_then(|g| g.get(r, c).value)
                 .map(|v| (v, Source::Full)),
+            Overlay::Backbone => self
+                .backbone
+                .as_ref()
+                .and_then(|g| g.get(r, c).value)
+                .map(|v| (v, Source::Backbone)),
             Overlay::Step => {
                 self.stepper
                     .as_ref()
@@ -495,6 +561,7 @@ impl App {
                         Source::Given => given_color,
                         Source::Logic => logic_color,
                         Source::Full => full_color,
+                        Source::Backbone => BACKBONE_COLOR,
                         Source::SearchProven => search_color,
                         Source::SearchGuess => guess_color,
                     };
@@ -544,13 +611,21 @@ impl App {
     /// The top control bar: view buttons, stepping controls, board presets.
     fn draw_controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("SatSight");
-            ui.separator();
             if ui.button("Deduce (logic)").clicked() {
                 self.run_logic();
             }
             if ui.button("Full solve").clicked() {
                 self.run_full();
+            }
+            if ui
+                .button("Backbone")
+                .on_hover_text(
+                    "Cells forced across every solution consistent with the givens \
+                     (plan §1). Most telling on an ambiguous board — delete a given first.",
+                )
+                .clicked()
+            {
+                self.run_backbone();
             }
             ui.separator();
             if ui.button("Hard sample").clicked() {
@@ -561,10 +636,6 @@ impl App {
             }
             if ui.button("Empty").clicked() {
                 self.load(Sudoku::empty());
-            }
-            ui.separator();
-            if ui.button("Help ?").clicked() {
-                self.show_help = !self.show_help;
             }
         });
 
@@ -614,6 +685,7 @@ impl App {
                 let search = egui::Color32::from_rgb(120, 200, 120);
                 color_key(ui, search, "search-proven");
                 color_key(ui, ui.visuals().weak_text_color(), "full-solve");
+                color_key(ui, BACKBONE_COLOR, "backbone");
                 color_key(ui, ui.visuals().strong_text_color(), "given");
                 if self.overlay == Overlay::Step {
                     color_key(ui, search.gamma_multiply(0.5), "guess (hypothetical)");
@@ -724,6 +796,15 @@ fn help_views(ui: &mut egui::Ui) {
     );
     bullet(
         ui,
+        "Backbone",
+        "Fills only the cells that hold the same value in \u{2014} every \u{2014} solution \
+         consistent with the givens (plan \u{00a7}1's \u{201c}facts across all \
+         solutions\u{201d}). A uniquely solvable board's backbone is its whole \
+         solution; on an ambiguous board it is exactly the cells that never vary, so \
+         delete a given and press it again to see which cells stay pinned.",
+    );
+    bullet(
+        ui,
         "Step",
         "Drives the hand-written CDCL search one event at a time, so you can watch it \
          guess, propagate forced cells, hit conflicts, learn, and backtrack. This is \
@@ -779,6 +860,13 @@ fn help_legend(ui: &mut egui::Ui) {
         full,
         "full-solve",
         "a cell filled in by the complete BatSat solution.",
+    );
+    legend(
+        ui,
+        BACKBONE_COLOR,
+        "backbone",
+        "a cell that takes the same value in every solution consistent with the \
+         givens \u{2014} a fact that holds across all solutions, from the Backbone view.",
     );
 
     section(ui, "Pencil marks (Step view)");
@@ -1019,8 +1107,9 @@ fn digit_key(d: u8) -> egui::Key {
     }
 }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl App {
+    /// The Sudoku view: stepper pump, controls, grid, and status.
+    fn update_sudoku(&mut self, ctx: &egui::Context) {
         self.handle_keys(ctx);
 
         // Advance a playing stepper N steps this frame, then keep the UI live.
@@ -1050,7 +1139,6 @@ impl eframe::App for App {
         });
 
         self.draw_status(ctx);
-        self.draw_help(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(6.0);
@@ -1058,6 +1146,35 @@ impl eframe::App for App {
                 self.draw_grid(ui);
             });
         });
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A shared top bar carries the title, the puzzle switch, and the help
+        // toggle; each puzzle then owns the rest of the frame. Switching kind
+        // simply routes to a different view — the two hold independent state.
+        egui::TopBottomPanel::top("kind").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading("SatSight");
+                ui.separator();
+                ui.selectable_value(&mut self.kind, PuzzleKind::Sudoku, "Sudoku");
+                ui.selectable_value(&mut self.kind, PuzzleKind::Coloring, "Graph coloring");
+                ui.separator();
+                if ui.button("Help ?").clicked() {
+                    self.show_help = !self.show_help;
+                }
+            });
+            ui.add_space(4.0);
+        });
+
+        self.draw_help(ctx);
+
+        match self.kind {
+            PuzzleKind::Sudoku => self.update_sudoku(ctx),
+            PuzzleKind::Coloring => self.coloring.ui(ctx),
+        }
     }
 }
 

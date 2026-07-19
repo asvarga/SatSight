@@ -21,4 +21,4 @@ pub mod coloring;
 pub mod puzzle;
 pub mod sudoku;
 
-pub use puzzle::{deduce, solve, Deductions, Grid, Puzzle};
+pub use puzzle::{backbone, deduce, solve, Deductions, Grid, Puzzle};

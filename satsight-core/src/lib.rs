@@ -11,6 +11,8 @@
 //!
 //! - [`registry`] — the [`Registry`] bijection: **the bridge** both directions
 //!   cross.
+//! - [`backbone`] — extraction of the facts true in *every* model (plan §1),
+//!   generic over the [`Solver`] trait.
 //! - [`cnf`] — the rustsat `Var`/`Lit`/`Clause`/`Cnf` vocabulary plus a fresh
 //!   auxiliary-variable source.
 //! - [`encodings`] — exactly-one / at-most-one (pairwise + sequential).
@@ -25,6 +27,7 @@
 //! The richer [`SolverView`] artifacts (candidate lattice, learned clauses,
 //! probing) arrive in later milestones.
 
+pub mod backbone;
 pub mod backend_batsat;
 pub mod cdcl;
 pub mod cnf;
@@ -34,6 +37,7 @@ pub mod registry;
 pub mod solver;
 pub mod view;
 
+pub use backbone::backbone;
 pub use backend_batsat::BatSatBackend;
 pub use cdcl::{Cdcl, ClauseRef, Event, Search};
 pub use cnf::{clause, var_count, Clause, Cnf, Lit, Var, VarManager};

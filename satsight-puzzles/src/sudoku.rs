@@ -347,7 +347,7 @@ pub fn render(grid: &Grid<SudokuCell>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{render, Cell, Sudoku, SudokuCell};
-    use crate::puzzle::{deduce, solve, Grid, Puzzle};
+    use crate::puzzle::{backbone, deduce, solve, Grid, Puzzle};
     use satsight_core::cdcl::Cdcl;
     use satsight_core::registry::Registry;
     use satsight_core::solver::{SolveOutcome, Solver};
@@ -565,6 +565,30 @@ mod tests {
         assert_eq!(report.givens, 0);
         assert!(report.placements.is_empty());
         assert_eq!(report.eliminations, 0);
+    }
+
+    #[test]
+    fn backbone_of_a_unique_board_is_the_full_solution() {
+        // A uniquely solvable board has exactly one model, so its backbone forces
+        // every cell — and, decoded through the reused `project_deductions`, must
+        // reconstruct the whole solution.
+        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
+        let bb = backbone(&puzzle);
+        assert!(bb.satisfiable);
+        let grid = puzzle.project_deductions(&bb);
+        assert_eq!(grid_to_string(&grid), SOLUTION);
+        assert!(is_valid_solution(&grid));
+    }
+
+    #[test]
+    fn contradictory_givens_have_no_backbone() {
+        // Two 5s in row 0: UNSAT, so the backbone is empty and flagged unsatisfiable.
+        let mut ascii = String::from("55");
+        ascii.push_str(&".".repeat(79));
+        let puzzle = Sudoku::from_ascii(&ascii).unwrap();
+        let bb = backbone(&puzzle);
+        assert!(!bb.satisfiable);
+        assert!(bb.proven.is_empty());
     }
 
     #[test]

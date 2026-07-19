@@ -10,7 +10,7 @@
 //!   on contradictory givens it flags the conflicting clues (the UNSAT core).
 //! - **Step** drives the observable hand-written CDCL one [`Event`] at a time
 //!   (plan §6): watch it guess, propagate forced cells, hit conflicts, learn, and
-//!   backtrack, with live corner-mark candidates — the bidirectional thesis in
+//!   backtrack, with live candidate marks — the bidirectional thesis in
 //!   motion. Placements and eliminations forced by the givens alone (proven) are
 //!   drawn solid; those contingent on a search guess (hypothetical) are drawn
 //!   faded and struck, so known facts read apart from tentative ones (plan §1). A
@@ -36,7 +36,8 @@ use satsight_puzzles::{deduce, Grid, Puzzle};
 
 use stepper::{Certainty, Emphasis, Stepper};
 
-/// Corner marks: digits propagation has confined to a few cells of a 3×3 box.
+/// Box-confined candidates: digits propagation has cornered into a few cells of a
+/// 3×3 box, highlighted in their own slot rather than drawn in the cell's corners.
 const CORNER_MARK_COLOR: egui::Color32 = egui::Color32::from_rgb(168, 130, 224);
 
 /// Native entry point: open a window (plan §9; wasm entry point below).
@@ -531,7 +532,7 @@ impl App {
                 color_key(ui, ui.visuals().strong_text_color(), "given");
                 if self.overlay == Overlay::Step {
                     color_key(ui, search.gamma_multiply(0.5), "guess (hypothetical)");
-                    color_key(ui, CORNER_MARK_COLOR, "corner mark (box-confined)");
+                    color_key(ui, CORNER_MARK_COLOR, "box-confined candidate");
                 }
             });
             ui.add_space(2.0);
@@ -668,29 +669,36 @@ fn help_legend(ui: &mut egui::Ui) {
     );
 
     section(ui, "Pencil marks (Step view)");
+    ui.label(
+        "Every candidate digit keeps one fixed home in a 3\u{00d7}3 (1 top-left \
+         \u{2026} 9 bottom-right), so a digit never moves \u{2014} its colour and \
+         style alone tell its status, and no two marks ever overlap.",
+    );
+    ui.add_space(4.0);
     legend(
         ui,
         center,
-        "center marks",
-        "the candidate digits still Boolean-possible in an unsolved cell (the \
-         propagation survivors), laid out as a small 3\u{00d7}3 once the cell narrows.",
-    );
-    legend(
-        ui,
-        guess,
-        "struck center mark",
-        "a candidate the current guess rules out \u{2014} a hypothetical elimination, \
-         drawn struck through. A proven elimination is simply absent: known non-facts \
-         aren't drawn.",
+        "candidate",
+        "a digit still Boolean-possible in an unsolved cell (a propagation \
+         survivor). The full set appears once the cell narrows to a few.",
     );
     legend(
         ui,
         CORNER_MARK_COLOR,
-        "corner marks",
-        "a digit propagation has confined to just a few cells of a 3\u{00d7}3 box \
+        "box-confined",
+        "a candidate propagation has confined to just a few cells of a 3\u{00d7}3 box \
          \u{2014} \u{201c}the 7 goes in one of these cells\u{201d} (a hidden \
-         pair/triple footprint). A digit pinned to one cell is a hidden single and \
-         gets placed instead.",
+         pair/triple footprint). Highlighted in its own slot so the footprint reads \
+         across the box; a digit pinned to a single cell is a hidden single and gets \
+         placed instead.",
+    );
+    legend(
+        ui,
+        guess,
+        "struck candidate",
+        "a candidate the current guess rules out \u{2014} a hypothetical elimination, \
+         drawn struck through in its slot. A proven elimination is simply absent: \
+         known non-facts aren't drawn.",
     );
 
     section(ui, "Highlights");
@@ -780,11 +788,15 @@ fn draw_grid_lines(
 }
 
 /// A cell's pencil-mark state for the Step view: the per-value flags plus the
-/// palette to paint them with.
+/// palette to paint them with. Every flagged value shares one fixed slot in the
+/// cell's 3×3; the three arrays are mutually exclusive per value, so exactly one
+/// style ever lands in a slot.
 struct CandidateMarks {
-    /// Values still Boolean-possible in the cell (center marks).
+    /// Values still Boolean-possible in the cell (the surviving candidates).
     candidates: [bool; 9],
-    /// Values propagation has confined to a few cells of the box (corner marks).
+    /// Values propagation has confined to a few cells of the box — box-confined
+    /// candidates (a subset of `candidates`), highlighted in place so the "goes in
+    /// one of these cells" footprint reads across the box.
     corner: [bool; 9],
     /// Values the current guess rules out here — hypothetical eliminations, shown
     /// struck through so a contingent elimination reads apart from a proven one.
@@ -794,46 +806,64 @@ struct CandidateMarks {
     guess_color: egui::Color32,
 }
 
-/// Draw a cell's pencil marks while the search runs (Step view): the surviving
-/// candidate digits laid out as a 3×3 of **center marks**, plus any **corner
-/// marks** — digits propagation has confined to a few cells of the 3×3 box,
-/// pinned to the cell's corners ("the 7 goes in one of these cells"). A digit
-/// promoted to a corner mark is drawn only in its corner, never twice.
+/// Draw a cell's pencil marks while the search runs (Step view). Every value has
+/// one fixed home in a positional 3×3 (1 top-left … 9 bottom-right) and its
+/// **style alone** tells its status, so marks never overlap or move (plan §8):
+///
+/// - a plain surviving candidate is drawn faint;
+/// - a **box-confined** candidate — propagation has cornered the value into a few
+///   cells of the 3×3 box ("the 7 goes in one of these") — keeps its slot but is
+///   highlighted, so the footprint reads across the box;
+/// - a value the current guess rules out is drawn struck through: a *hypothetical*
+///   elimination (plan §1). A proven elimination is simply absent.
+///
+/// The full candidate grid appears once a cell narrows to ≤6 survivors; above that
+/// only the box-confined hints show, keeping a busy cell legible.
 fn draw_candidates(painter: &egui::Painter, rect: egui::Rect, cell: f32, marks: &CandidateMarks) {
-    // Center marks: the full candidate list as a positional 3×3, but only once
-    // the search has meaningfully narrowed the cell — and never a digit promoted
-    // to a corner mark (drawn below instead of twice).
-    if marks.candidates.iter().filter(|&&b| b).count() <= 6 {
-        let sub = cell / 3.0;
-        let mark_pos = |i: usize| {
-            let (sr, sc) = (i / 3, i % 3);
-            rect.min + egui::vec2((sc as f32 + 0.5) * sub, (sr as f32 + 0.5) * sub)
-        };
-        for (i, &alive) in marks.candidates.iter().enumerate() {
-            if !alive || marks.corner[i] {
-                continue;
-            }
-            painter.text(
-                mark_pos(i),
-                egui::Align2::CENTER_CENTER,
-                (i + 1).to_string(),
-                egui::FontId::proportional(sub * 0.62),
-                marks.color,
+    let sub = cell / 3.0;
+    let slot = |i: usize| {
+        let (sr, sc) = (i / 3, i % 3);
+        rect.min + egui::vec2((sc as f32 + 0.5) * sub, (sr as f32 + 0.5) * sub)
+    };
+    let font = egui::FontId::proportional(sub * 0.62);
+    // Show the full grid only once the cell has narrowed; above that the faint
+    // candidates would just be clutter, so we keep only the box-confined hints.
+    let show_all = marks.candidates.iter().filter(|&&b| b).count() <= 6;
+
+    for i in 0..9 {
+        let pos = slot(i);
+        if marks.corner[i] {
+            // Box-confined: highlight this digit's slot so the "v goes in one of
+            // these cells" footprint reads across the box, then recolour it. Shown
+            // even in a busy cell — it is the actionable hint.
+            painter.rect_filled(
+                egui::Rect::from_center_size(pos, egui::vec2(sub * 0.9, sub * 0.9)),
+                2.0,
+                marks.corner_color.gamma_multiply(0.20),
             );
-        }
-        // Hypothetical eliminations: values the current guess (not the givens)
-        // rules out here, drawn struck through so they read as contingent — a
-        // known elimination is simply absent instead (plan §1).
-        for (i, &gone) in marks.guess_eliminated.iter().enumerate() {
-            if !gone {
-                continue;
-            }
-            let pos = mark_pos(i);
             painter.text(
                 pos,
                 egui::Align2::CENTER_CENTER,
                 (i + 1).to_string(),
-                egui::FontId::proportional(sub * 0.62),
+                font.clone(),
+                marks.corner_color,
+            );
+        } else if show_all && marks.candidates[i] {
+            painter.text(
+                pos,
+                egui::Align2::CENTER_CENTER,
+                (i + 1).to_string(),
+                font.clone(),
+                marks.color,
+            );
+        } else if show_all && marks.guess_eliminated[i] {
+            // Ruled out by the current guess (not the givens): same slot, struck
+            // through so it reads as contingent (plan §1).
+            painter.text(
+                pos,
+                egui::Align2::CENTER_CENTER,
+                (i + 1).to_string(),
+                font.clone(),
                 marks.guess_color,
             );
             let reach = sub * 0.3;
@@ -842,39 +872,6 @@ fn draw_candidates(painter: &egui::Painter, rect: egui::Rect, cell: f32, marks: 
                 egui::Stroke::new(1.0, marks.guess_color),
             );
         }
-    }
-
-    // Corner marks: box-confined digits, one faint chip per corner (up to four),
-    // so they read even over the center marks behind them.
-    let inset = cell * 0.17;
-    let slots = [
-        egui::vec2(inset, inset),
-        egui::vec2(cell - inset, inset),
-        egui::vec2(inset, cell - inset),
-        egui::vec2(cell - inset, cell - inset),
-    ];
-    let chip = cell * 0.30;
-    for (slot, digit) in marks
-        .corner
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &m)| m.then_some(i))
-        .take(slots.len())
-        .enumerate()
-    {
-        let center = rect.min + slots[slot];
-        painter.rect_filled(
-            egui::Rect::from_center_size(center, egui::vec2(chip, chip)),
-            2.0,
-            marks.corner_color.gamma_multiply(0.22),
-        );
-        painter.text(
-            center,
-            egui::Align2::CENTER_CENTER,
-            (digit + 1).to_string(),
-            egui::FontId::proportional(cell * 0.26),
-            marks.corner_color,
-        );
     }
 }
 

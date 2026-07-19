@@ -8,17 +8,21 @@
 //! decoded solver state straight onto the graph — forced colors, the full coloring,
 //! and the colors that hold across *every* coloring — in the puzzle's own language.
 //!
-//! The observable Step-view CDCL animation is Sudoku-specific in the renderer and
-//! is deferred (a note on issue #6); this view covers the search-free and
-//! full-solve maps, which is enough to demonstrate the abstraction is not
-//! Sudoku-shaped.
+//! The **Step** view drives the observable CDCL one event at a time on the graph
+//! (issue #12), the same animation the Sudoku view shows: it decides, propagates,
+//! conflicts, learns, and backtracks, painting decided vertices apart from the
+//! candidate-color pips of undecided ones and proven facts apart from hypothetical
+//! ones — exactly the generic [`Stepper`] the Sudoku grid uses, now that it is no
+//! longer Sudoku-shaped.
 
 use std::f32::consts::PI;
 
 use eframe::egui;
-use satsight_core::{BatSatBackend, Cnf, Registry, SolveOutcome, Solver, SolverView};
+use satsight_core::{BatSatBackend, Cdcl, Cnf, Event, Registry, SolveOutcome, Solver, SolverView};
 use satsight_puzzles::coloring::{ColoringCell, GraphColoring, VertexColor};
 use satsight_puzzles::{backbone, deduce, Grid, Puzzle};
+
+use crate::stepper::{solver_phase, Certainty, Stepper, READY};
 
 /// Distinct fills for colors `0..`; the Petersen graph is 3-chromatic, so three
 /// are used, with a fourth on hand if the budget is ever raised.
@@ -35,6 +39,11 @@ const FULL_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
 /// The backbone accent — forced in every coloring. Shared with the Sudoku view.
 pub const BACKBONE_COLOR: egui::Color32 = egui::Color32::from_rgb(56, 178, 172);
 const CORE_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 70, 70);
+/// A vertex the stepped search has colored under the givens alone — a proven
+/// fact; the search accent, matching the Sudoku Step view.
+const SEARCH_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 200, 120);
+/// The vertex the last Step event touched (decision/propagation/conflict).
+const EMPHASIS_COLOR: egui::Color32 = egui::Color32::from_rgb(240, 190, 90);
 
 /// Which decoded artifact the graph is painting over the givens.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,6 +52,8 @@ enum Overlay {
     Logic,
     Full,
     Backbone,
+    /// The live state of the stepped CDCL search.
+    Step,
 }
 
 /// The graph-coloring view: a fixed graph, its layout, and cached backward maps.
@@ -54,6 +65,8 @@ pub struct ColoringView {
     /// The graph never changes, so only the assumptions (color givens) do.
     reg: Registry<VertexColor>,
     batsat: BatSatBackend,
+    /// The observable CDCL over the rule CNF, spawning a [`Stepper`] per Step run.
+    cdcl: Cdcl,
     overlay: Overlay,
     /// Colors forced by pure logic (propagation + probing), or `None` until run.
     logic: Option<Grid<ColoringCell>>,
@@ -61,8 +74,12 @@ pub struct ColoringView {
     full: Option<Grid<ColoringCell>>,
     /// Colors forced across *every* coloring (the backbone), or `None` until run.
     backbone: Option<Grid<ColoringCell>>,
+    /// The live stepped search, or `None` until "Step"/"Play" is pressed.
+    stepper: Option<Stepper<VertexColor>>,
     /// Vertices named by an UNSAT core, flagged in red (plan §4).
     core: Vec<usize>,
+    /// Steps advanced per frame while playing.
+    speed: u32,
     status: String,
 }
 
@@ -79,18 +96,22 @@ impl ColoringView {
         puzzle.encode_rules(&mut reg, &mut cnf);
         let mut batsat = BatSatBackend::new();
         batsat.load_rules(&cnf);
+        let cdcl = Cdcl::from_cnf(&cnf);
         Self {
             puzzle,
             positions,
             reg,
             batsat,
+            cdcl,
             overlay: Overlay::None,
             logic: None,
             full: None,
             backbone: None,
+            stepper: None,
             core: Vec::new(),
+            speed: 8,
             status: "The Petersen graph, 3 colors. Click a vertex to cycle its color, \
-                     then Deduce, Full solve, or Backbone."
+                     then Deduce, Full solve, Backbone, or Step."
                 .to_owned(),
         }
     }
@@ -101,6 +122,7 @@ impl ColoringView {
         self.logic = None;
         self.full = None;
         self.backbone = None;
+        self.stepper = None;
         self.core.clear();
     }
 
@@ -188,6 +210,71 @@ impl ColoringView {
         self.core.clear();
     }
 
+    /// Begin (or restart) a stepped search over the current pre-colorings.
+    fn start_stepper(&mut self) {
+        let assumptions = self.puzzle.assumptions(&self.reg);
+        self.stepper = Some(Stepper::new(&self.cdcl, self.reg.clone(), &assumptions));
+        self.overlay = Overlay::Step;
+        self.core.clear();
+    }
+
+    /// Advance the stepper by one event, syncing the UNSAT-core highlight.
+    fn step_once(&mut self) {
+        if self.stepper.is_none() {
+            self.start_stepper();
+        }
+        if let Some(st) = &mut self.stepper {
+            st.step();
+        }
+        self.sync_core();
+    }
+
+    /// Pull the current core vertices out of the stepper (empty unless it hit
+    /// UNSAT).
+    fn sync_core(&mut self) {
+        self.core = self
+            .stepper
+            .as_ref()
+            .map(step_core_vertices)
+            .unwrap_or_default();
+    }
+
+    /// The stepper's last event, decoded into a one-line status in the coloring
+    /// puzzle's own vocabulary (the solver-mechanics moves come from the shared
+    /// [`solver_phase`]).
+    fn step_status(&self) -> String {
+        let Some(st) = &self.stepper else {
+            return READY.to_owned();
+        };
+        let Some(event) = st.last_event() else {
+            return READY.to_owned();
+        };
+        if let Some(phase) = solver_phase(event) {
+            return phase;
+        }
+        match event {
+            Event::Decide { lit } => {
+                let (vc, holds) = st.decode(*lit).expect("a coloring literal decodes");
+                let rel = if holds { "=" } else { "≠" };
+                format!("Guess: vertex {} {rel} {}", vc.vertex, color_name(vc.color))
+            }
+            Event::Propagate { lit, .. } => {
+                let (vc, holds) = st.decode(*lit).expect("a coloring literal decodes");
+                if holds {
+                    format!("Forced: vertex {} = {}", vc.vertex, color_name(vc.color))
+                } else {
+                    format!("Ruled out {} at vertex {}", color_name(vc.color), vc.vertex)
+                }
+            }
+            Event::Sat => "A proper coloring, found by search!".to_owned(),
+            Event::Unsat { .. } => {
+                "These pre-colorings contradict — no proper coloring exists.".to_owned()
+            }
+            // Conflict/Backtrack/Learn are handled by `solver_phase` above.
+            _ => unreachable!("solver_phase covers the remaining events"),
+        }
+    }
+
     /// Clear every given color.
     fn clear(&mut self) {
         for v in 0..self.puzzle.n_vertices() {
@@ -208,18 +295,67 @@ impl ColoringView {
         vs
     }
 
-    /// The grid backing the current overlay, if any.
+    /// The grid backing the current overlay, if any. The Step view reads live
+    /// state straight from the [`Stepper`] instead of a cached grid, so it has no
+    /// grid here.
     fn overlay_grid(&self) -> Option<&Grid<ColoringCell>> {
         match self.overlay {
-            Overlay::None => None,
+            Overlay::None | Overlay::Step => None,
             Overlay::Logic => self.logic.as_ref(),
             Overlay::Full => self.full.as_ref(),
             Overlay::Backbone => self.backbone.as_ref(),
         }
     }
 
+    /// The live Step state of vertex `v`: its decided color (proven vs
+    /// hypothetical), its still-possible candidate colors, and the colors ruled
+    /// out only under the current guess. `None` if no search is running.
+    fn step_vertex(&self, vertex: usize, n_colors: usize) -> Option<StepVertex> {
+        let st = self.stepper.as_ref()?;
+        let placed = (0..n_colors)
+            .find(|&color| st.value(&VertexColor { vertex, color }) == Some(true))
+            .map(|color| (color, st.certainty(&VertexColor { vertex, color })));
+        let candidate = (0..n_colors)
+            .map(|color| st.value(&VertexColor { vertex, color }) != Some(false))
+            .collect();
+        let base = st.base_level();
+        let hypo_eliminated = (0..n_colors)
+            .map(|color| {
+                matches!(
+                    st.assigned(&VertexColor { vertex, color }),
+                    Some((false, level)) if level > base
+                )
+            })
+            .collect();
+        Some(StepVertex {
+            placed,
+            candidate,
+            hypo_eliminated,
+        })
+    }
+
     /// Render the whole view: controls, the graph, and the status/legend bar.
     pub fn ui(&mut self, ctx: &egui::Context) {
+        // Advance a playing stepper N steps this frame, then keep the UI live.
+        let speed = self.speed;
+        let mut advanced = false;
+        if let Some(st) = &mut self.stepper {
+            if st.playing && !st.is_done() {
+                for _ in 0..speed {
+                    st.step();
+                    if st.is_done() {
+                        st.playing = false;
+                        break;
+                    }
+                }
+                advanced = true;
+            }
+        }
+        if advanced {
+            self.sync_core();
+            ctx.request_repaint();
+        }
+
         egui::TopBottomPanel::top("coloring_controls").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -242,6 +378,29 @@ impl ColoringView {
                 }
                 ui.label(format!("{} colors available", self.puzzle.n_colors()));
             });
+            ui.horizontal(|ui| {
+                ui.label("Step the CDCL:");
+                if ui.button("Step ▶").clicked() {
+                    self.step_once();
+                }
+                let playing = self.stepper.as_ref().is_some_and(|st| st.playing);
+                let done = self.stepper.as_ref().is_some_and(Stepper::is_done);
+                if ui
+                    .button(if playing { "Pause ⏸" } else { "Play ⏵" })
+                    .clicked()
+                {
+                    if self.stepper.is_none() || done {
+                        self.start_stepper();
+                    }
+                    if let Some(st) = &mut self.stepper {
+                        st.playing = !st.playing;
+                    }
+                }
+                if ui.button("Restart ⟲").clicked() {
+                    self.start_stepper();
+                }
+                ui.add(egui::Slider::new(&mut self.speed, 1..=200).text("steps/frame"));
+            });
             ui.add_space(4.0);
         });
 
@@ -253,9 +412,21 @@ impl ColoringView {
                 swatch(ui, FULL_COLOR, "full-solve");
                 swatch(ui, BACKBONE_COLOR, "backbone (all colorings)");
                 swatch(ui, CORE_COLOR, "UNSAT core");
+                if self.overlay == Overlay::Step {
+                    swatch(ui, SEARCH_COLOR, "search-proven");
+                    swatch(ui, SEARCH_COLOR.gamma_multiply(0.5), "guess (hypothetical)");
+                    swatch(ui, EMPHASIS_COLOR, "last step");
+                }
             });
             ui.add_space(2.0);
-            ui.label(&self.status);
+            // In Step mode the status tracks the live event; otherwise the last
+            // action's summary.
+            let line = if self.overlay == Overlay::Step {
+                self.step_status()
+            } else {
+                self.status.clone()
+            };
+            ui.label(line);
             ui.add_space(4.0);
         });
 
@@ -265,15 +436,68 @@ impl ColoringView {
         });
     }
 
+    /// The fill color and provenance ring for vertex `v`. A given keeps its strong
+    /// ring in every view; the Step view reads live search state (a proven vs a
+    /// hypothetical placement), the others the cached overlay `grid` (or, with no
+    /// overlay, just the givens).
+    fn vertex_fill_ring(
+        &self,
+        v: usize,
+        given: bool,
+        step_state: Option<&StepVertex>,
+        grid: Option<&Grid<ColoringCell>>,
+        theme: &GraphTheme,
+    ) -> (egui::Color32, egui::Stroke) {
+        if given {
+            let c = self.puzzle.fixed(v).expect("a given vertex has a color");
+            return (PALETTE[c % PALETTE.len()], theme.given_ring);
+        }
+        if self.overlay == Overlay::Step {
+            return match step_state.and_then(|sv| sv.placed) {
+                // A vertex colored by the givens alone (proven) vs one colored only
+                // under the current guess (hypothetical), drawn faded.
+                Some((c, Certainty::Proven)) => (
+                    PALETTE[c % PALETTE.len()],
+                    egui::Stroke::new(2.5, SEARCH_COLOR),
+                ),
+                Some((c, Certainty::Hypothetical)) => (
+                    PALETTE[c % PALETTE.len()].gamma_multiply(0.5),
+                    egui::Stroke::new(2.5, SEARCH_COLOR.gamma_multiply(0.5)),
+                ),
+                // Undecided: hollow, with candidate-color pips drawn separately.
+                None => (theme.hollow, theme.free_ring),
+            };
+        }
+        let color = grid.map_or_else(|| self.puzzle.fixed(v), |g| GraphColoring::color_at(g, v));
+        let ring = if color.is_some() {
+            let accent = match self.overlay {
+                Overlay::Backbone => BACKBONE_COLOR,
+                Overlay::Full => FULL_COLOR,
+                _ => LOGIC_COLOR,
+            };
+            egui::Stroke::new(2.5, accent)
+        } else {
+            theme.free_ring
+        };
+        (
+            color.map_or(theme.hollow, |c| PALETTE[c % PALETTE.len()]),
+            ring,
+        )
+    }
+
     /// Draw the graph and handle clicks (cycling a clicked vertex's color).
     fn draw_graph(&mut self, ui: &mut egui::Ui) {
         let visuals = ui.visuals();
         let edge_stroke = egui::Stroke::new(1.5, visuals.weak_text_color());
         let core_stroke = egui::Stroke::new(2.5, CORE_COLOR);
-        let given_ring = egui::Stroke::new(3.0, visuals.strong_text_color());
-        let free_ring = egui::Stroke::new(1.5, visuals.weak_text_color());
-        let hollow = visuals.extreme_bg_color;
         let label_color = visuals.strong_text_color();
+        // The faint accent for a struck candidate pip (a hypothetical elimination).
+        let pip_weak = visuals.weak_text_color();
+        let theme = GraphTheme {
+            given_ring: egui::Stroke::new(3.0, visuals.strong_text_color()),
+            free_ring: egui::Stroke::new(1.5, visuals.weak_text_color()),
+            hollow: visuals.extreme_bg_color,
+        };
 
         let side = ui
             .available_width()
@@ -284,6 +508,17 @@ impl ColoringView {
         let radius = side * 0.05;
         let to_screen = |p: egui::Pos2| rect.min + egui::vec2(p.x * side, p.y * side);
         let grid = self.overlay_grid();
+        let stepping = self.overlay == Overlay::Step;
+        let n_colors = self.puzzle.n_colors();
+        // In the Step view, the vertices the last event touched (amber outline).
+        let emphasis: Vec<usize> = if stepping {
+            self.stepper
+                .as_ref()
+                .map(step_touched_vertices)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         // Edges first, so vertices draw on top. An edge between two core vertices
         // is flagged (a same-color clash the core is about).
@@ -298,31 +533,31 @@ impl ColoringView {
         for v in 0..self.puzzle.n_vertices() {
             let center = to_screen(self.positions[v]);
             let given = self.puzzle.fixed(v).is_some();
-            // The color to show: the given, or whatever the overlay's grid decodes.
-            let color = if let Some(g) = grid {
-                GraphColoring::color_at(g, v)
-            } else {
-                self.puzzle.fixed(v)
-            };
-            let fill = color.map_or(hollow, |c| PALETTE[c % PALETTE.len()]);
+            // The Step view reads live search state per vertex; the others read the
+            // cached overlay grid (or, with no overlay, just the givens).
+            let step_state = (stepping && !given)
+                .then(|| self.step_vertex(v, n_colors))
+                .flatten();
+
+            // Fill + provenance ring. A given keeps its strong ring in every view.
+            let (fill, mut ring) =
+                self.vertex_fill_ring(v, given, step_state.as_ref(), grid, &theme);
             painter.circle_filled(center, radius, fill);
 
-            // The ring encodes provenance: given (strong), derived (overlay accent),
-            // or free/undetermined (weak). If a core flags this vertex, ring it red.
-            let ring = if self.core.contains(&v) {
-                core_stroke
-            } else if given {
-                given_ring
-            } else if color.is_some() {
-                let accent = match self.overlay {
-                    Overlay::Backbone => BACKBONE_COLOR,
-                    Overlay::Full => FULL_COLOR,
-                    _ => LOGIC_COLOR,
-                };
-                egui::Stroke::new(2.5, accent)
-            } else {
-                free_ring
-            };
+            // Candidate-color pips for an undecided Step vertex: a filled dot per
+            // still-possible color, a struck dot for a hypothetical elimination.
+            if let Some(sv) = step_state.as_ref() {
+                if sv.placed.is_none() {
+                    draw_color_pips(&painter, center, radius, sv, pip_weak);
+                }
+            }
+
+            // The core (red) and last-touched (amber) outlines win over provenance.
+            if self.core.contains(&v) {
+                ring = core_stroke;
+            } else if emphasis.contains(&v) {
+                ring = egui::Stroke::new(2.5, EMPHASIS_COLOR);
+            }
             painter.circle_stroke(center, radius, ring);
             painter.text(
                 center,
@@ -381,4 +616,172 @@ fn swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 2.0, color);
     ui.label(label);
+}
+
+/// The theme-derived strokes and fill the graph drawing reuses for every vertex.
+struct GraphTheme {
+    /// The strong ring on a given (pre-colored) vertex.
+    given_ring: egui::Stroke,
+    /// The weak ring on a free/undetermined vertex.
+    free_ring: egui::Stroke,
+    /// The fill for a vertex with no color to show.
+    hollow: egui::Color32,
+}
+
+/// One vertex's live Step state, mirroring the Sudoku grid's per-cell marks:
+/// which color (if any) it holds and with what [`Certainty`], its surviving
+/// candidate colors, and the colors ruled out only under the current guess.
+struct StepVertex {
+    /// The decided color and whether it is proven (vs hypothetical), if any.
+    placed: Option<(usize, Certainty)>,
+    /// Per color: still Boolean-possible here (a candidate).
+    candidate: Vec<bool>,
+    /// Per color: ruled out only above the givens' base level (a hypothetical
+    /// elimination). A proven elimination is simply absent.
+    hypo_eliminated: Vec<bool>,
+}
+
+/// The vertices the stepper's last event touched, sorted and de-duped — the amber
+/// "last step" outline.
+fn step_touched_vertices(st: &Stepper<VertexColor>) -> Vec<usize> {
+    let mut vs: Vec<usize> = st.touched_props().iter().map(|vc| vc.vertex).collect();
+    vs.sort_unstable();
+    vs.dedup();
+    vs
+}
+
+/// The vertices an UNSAT core names, sorted and de-duped — the red core flag.
+fn step_core_vertices(st: &Stepper<VertexColor>) -> Vec<usize> {
+    let mut vs: Vec<usize> = st.core_props().iter().map(|vc| vc.vertex).collect();
+    vs.sort_unstable();
+    vs.dedup();
+    vs
+}
+
+/// Draw an undecided vertex's candidate-color pips: a small filled dot per color
+/// still possible, and a struck hollow dot for a color the current guess rules
+/// out (a *hypothetical* elimination, plan §1). A proven elimination is left
+/// blank — a known non-fact isn't drawn, matching the Sudoku Step view.
+fn draw_color_pips(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    sv: &StepVertex,
+    weak: egui::Color32,
+) {
+    let n = sv.candidate.len();
+    if n == 0 {
+        return;
+    }
+    let dot_r = radius * 0.24;
+    let gap = radius * 0.55;
+    let start = -gap * (n as f32 - 1.0) / 2.0;
+    for color in 0..n {
+        let pos = center + egui::vec2(start + gap * color as f32, 0.0);
+        if sv.candidate[color] {
+            painter.circle_filled(pos, dot_r, PALETTE[color % PALETTE.len()]);
+        } else if sv.hypo_eliminated[color] {
+            let stroke = egui::Stroke::new(1.0, weak);
+            painter.circle_stroke(pos, dot_r, stroke);
+            let reach = dot_r * 0.9;
+            painter.line_segment(
+                [pos - egui::vec2(reach, 0.0), pos + egui::vec2(reach, 0.0)],
+                stroke,
+            );
+        }
+    }
+}
+
+/// A human name for color index `c`, matching the [`PALETTE`] order.
+fn color_name(c: usize) -> String {
+    ["red", "green", "blue", "amber"]
+        .get(c)
+        .map_or_else(|| format!("color {c}"), |name| (*name).to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{color_name, step_core_vertices};
+    use crate::stepper::{Certainty, Stepper};
+    use satsight_core::{Cdcl, Cnf, Registry};
+    use satsight_puzzles::coloring::{GraphColoring, VertexColor};
+    use satsight_puzzles::Puzzle;
+
+    /// Encode `g`'s rules and start a stepped search over its pre-colorings —
+    /// exactly what [`ColoringView::start_stepper`](super::ColoringView) does.
+    fn stepper_for(g: &GraphColoring) -> Stepper<VertexColor> {
+        let mut reg = Registry::new();
+        let mut cnf = Cnf::new();
+        g.encode_rules(&mut reg, &mut cnf);
+        let assumptions = g.assumptions(&reg);
+        let cdcl = Cdcl::from_cnf(&cnf);
+        Stepper::new(&cdcl, reg, &assumptions)
+    }
+
+    #[test]
+    fn stepping_a_triangle_forces_the_last_color() {
+        // K3 with three colors, two vertices pinned to distinct colors: the *same*
+        // generic Stepper the Sudoku grid drives must place the third vertex on the
+        // one remaining color — and, being entailed by the givens alone, as a
+        // proven fact (issue #12: the Step view is no longer Sudoku-shaped).
+        let mut g = GraphColoring::complete(3, 3);
+        g.fix(0, Some(0));
+        g.fix(1, Some(1));
+        let mut st = stepper_for(&g);
+        let mut guard = 0;
+        while !st.is_done() {
+            st.step();
+            guard += 1;
+            assert!(guard < 100_000, "the search must terminate");
+        }
+        assert!(st.is_solved(), "K3 with two colors pinned is colorable");
+        let forced = VertexColor {
+            vertex: 2,
+            color: 2,
+        };
+        assert_eq!(st.value(&forced), Some(true), "vertex 2 takes color 2");
+        assert_eq!(
+            st.certainty(&forced),
+            Certainty::Proven,
+            "it holds in every coloring, so it reads as proven, not a guess"
+        );
+        // The other two colors are ruled out at vertex 2.
+        for color in [0, 1] {
+            assert_eq!(
+                st.value(&VertexColor { vertex: 2, color }),
+                Some(false),
+                "color {color} is ruled out at vertex 2"
+            );
+        }
+    }
+
+    #[test]
+    fn contradictory_precoloring_steps_to_an_unsat_core() {
+        // Two adjacent vertices pinned to the same color: the stepped search must
+        // finish UNSAT and the core must name those conflicting vertices — plan
+        // §4's core→givens highlight, decoded on the second puzzle.
+        let mut g = GraphColoring::new(2, 3);
+        g.add_edge(0, 1);
+        g.fix(0, Some(1));
+        g.fix(1, Some(1));
+        let mut st = stepper_for(&g);
+        while !st.is_done() {
+            st.step();
+        }
+        assert!(!st.is_solved(), "a same-color edge is uncolorable");
+        let core = step_core_vertices(&st);
+        assert!(!core.is_empty(), "UNSAT reports a core");
+        assert!(
+            core.iter().all(|&v| v == 0 || v == 1),
+            "the core names only the conflicting vertices"
+        );
+    }
+
+    #[test]
+    fn color_names_match_the_palette_order() {
+        assert_eq!(color_name(0), "red");
+        assert_eq!(color_name(2), "blue");
+        // Beyond the named palette, fall back to a numeric label.
+        assert_eq!(color_name(9), "color 9");
+    }
 }

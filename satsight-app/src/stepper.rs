@@ -1,30 +1,36 @@
-//! The stepping controller — the bridge between the observable CDCL and the grid.
+//! The stepping controller — the bridge between the observable CDCL and a view.
 //!
 //! This is the frontend half of plan §6: it owns a [`Search`] and drives it one
-//! [`Event`] at a time, decoding each move back into Sudoku terms through the
-//! [`Registry`] so the UI can render it. Kept deliberately egui-free so the
-//! decoding is unit-testable without a window.
+//! [`Event`] at a time, decoding each move back into the puzzle's own vocabulary
+//! through the [`Registry`] so the UI can render it. Kept deliberately egui-free
+//! so the decoding is unit-testable without a window.
 //!
-//! What it exposes to the renderer:
+//! It is **generic over the puzzle's proposition type** `V`, so one stepper drives
+//! Sudoku (`V = Cell`) and graph coloring (`V = VertexColor`) alike — the Step view
+//! is no longer Sudoku-shaped (issue #12). The generic half exposes the primitives
+//! every view needs, in puzzle-neutral terms:
 //!
-//! - [`placed`](Stepper::placed) — the digit the search currently forces in a
-//!   cell (its tentative value mid-search);
-//! - [`candidates`](Stepper::candidates) — the values still Boolean-possible in a
-//!   cell (plan §8's center marks: BCP survivors);
-//! - [`corner_marks`](Stepper::corner_marks) — per 3×3 box, the values BCP has
-//!   confined to a few cells ("the 7 goes in one of these cells");
-//! - [`placement`](Stepper::placement) / [`hypo_eliminated`](Stepper::hypo_eliminated)
-//!   — the same facts split by [`Certainty`]: entailed by the givens (proven) vs
-//!   contingent on a search guess (hypothetical), which the grid draws differently;
-//! - [`description`](Stepper::description) / [`emphasis`](Stepper::emphasis) — the
-//!   last event, decoded to a human sentence and to the cells to highlight;
-//! - [`core_cells`](Stepper::core_cells) — on UNSAT, the conflicting givens to
-//!   flag (plan §4's core→clues highlight).
+//! - [`value`](Stepper::value) / [`assigned`](Stepper::assigned) — the truth value
+//!   (and decision level) the search currently gives a proposition;
+//! - [`certainty`](Stepper::certainty) — whether that assignment is entailed by the
+//!   givens alone (**proven**) or contingent on a branching guess (**hypothetical**),
+//!   the distinction the grid draws differently (plan §1);
+//! - [`touched_props`](Stepper::touched_props) / [`core_props`](Stepper::core_props)
+//!   — the propositions the last event, or an UNSAT core, names, for a view to map
+//!   onto its own coordinates and highlight;
+//! - [`last_event`](Stepper::last_event) + [`solver_phase`] — the raw event and the
+//!   shared status text for the puzzle-agnostic moves (conflict/backtrack/learn).
+//!
+//! Each puzzle view composes these into its domain shapes: Sudoku's per-cell
+//! candidate digits and box-confinement corner marks live in the [`Stepper<Cell>`]
+//! impl below; graph coloring's per-vertex color pips live in the coloring view.
+
+use std::hash::Hash;
 
 use satsight_core::{Cdcl, Event, Lit, Registry, Search};
 use satsight_puzzles::sudoku::Cell;
 
-/// Which cells the last event wants the renderer to emphasize.
+/// Which cells the last event wants the Sudoku renderer to emphasize.
 pub enum Emphasis {
     /// Nothing in particular.
     None,
@@ -44,25 +50,46 @@ pub enum Certainty {
     Hypothetical,
 }
 
+/// The status line shown before the first step — shared across puzzle views.
+pub const READY: &str = "Ready — press Step or Play to watch the solver.";
+
 /// A value confined by propagation to at most this many cells of a 3×3 box is
 /// surfaced as a corner mark — the footprint of a hidden pair/triple ("one of
 /// these cells"). Wider than that is no hint; a value pinned to a single cell is
 /// a hidden single, shown as a placement instead.
 const CORNER_MARK_MAX_CELLS: usize = 3;
 
-/// Drives a [`Search`] event-by-event and decodes its state for the grid.
-pub struct Stepper {
-    reg: Registry<Cell>,
+/// The status phrase for the puzzle-agnostic solver events (conflict, backtrack,
+/// learn); `None` for the events a view names in its own vocabulary (decide,
+/// propagate, sat, unsat). Shared so every puzzle renders the mechanics
+/// identically and supplies only the vocabulary that differs.
+#[must_use]
+pub fn solver_phase(event: &Event) -> Option<String> {
+    match event {
+        Event::Conflict { .. } => Some("Conflict — analyzing and backtracking.".to_owned()),
+        Event::Backtrack { to_level } => Some(format!("Backtrack to level {to_level}.")),
+        Event::Learn { clause } => Some(format!("Learned a clause ({} literals).", clause.len())),
+        _ => None,
+    }
+}
+
+/// Drives a [`Search`] event-by-event and decodes its state for a puzzle view.
+///
+/// Generic over the proposition type `V`: the search machinery is puzzle-agnostic
+/// (it works on [`Lit`]s and decodes through the [`Registry<V>`]), so a single
+/// stepper serves every [`Puzzle`](satsight_puzzles::Puzzle).
+pub struct Stepper<V: Eq + Hash + Clone> {
+    reg: Registry<V>,
     search: Search,
     last: Option<Event>,
     /// Whether the UI is auto-advancing (owned here so the app can toggle it).
     pub playing: bool,
 }
 
-impl Stepper {
+impl<V: Eq + Hash + Clone> Stepper<V> {
     /// Begin a fresh stepped search over `assumptions` (the current givens).
     #[must_use]
-    pub fn new(cdcl: &Cdcl, reg: Registry<Cell>, assumptions: &[Lit]) -> Self {
+    pub fn new(cdcl: &Cdcl, reg: Registry<V>, assumptions: &[Lit]) -> Self {
         let search = cdcl.search(assumptions);
         Self {
             reg,
@@ -77,8 +104,7 @@ impl Stepper {
         if self.search.is_done() {
             return;
         }
-        let event = self.search.step();
-        self.last = Some(event);
+        self.last = Some(self.search.step());
     }
 
     /// Whether the search has reached SAT or UNSAT.
@@ -89,17 +115,106 @@ impl Stepper {
 
     /// Whether the search finished by *finding a solution* (SAT), as opposed to
     /// proving none exists (UNSAT) or still running. True exactly when the last
-    /// event was [`Event::Sat`] — the signal that the board is fully placed and
+    /// event was [`Event::Sat`] — the signal that the puzzle is fully placed and
     /// its negation can be blocked to hunt for a second solution.
     #[must_use]
     pub fn is_solved(&self) -> bool {
         matches!(self.last, Some(Event::Sat))
     }
 
+    /// The last event, for a view to name in its own vocabulary (the puzzle-neutral
+    /// moves come pre-rendered from [`solver_phase`]).
+    #[must_use]
+    pub fn last_event(&self) -> Option<&Event> {
+        self.last.as_ref()
+    }
+
+    /// The deepest decision level a given (assumption) occupies — the boundary
+    /// between proven and hypothetical mid-search facts (plan §1).
+    #[must_use]
+    pub fn base_level(&self) -> u32 {
+        self.search.base_level()
+    }
+
+    /// The truth value the search currently gives proposition `prop`:
+    /// `Some(true)` if forced, `Some(false)` if ruled out, `None` if undecided or
+    /// unregistered.
+    #[must_use]
+    pub fn value(&self, prop: &V) -> Option<bool> {
+        self.reg.get(prop).and_then(|var| self.search.value_of(var))
+    }
+
+    /// The truth value of `prop` and the decision level it was set at, if assigned
+    /// — the raw material for the proven/hypothetical split.
+    #[must_use]
+    pub fn assigned(&self, prop: &V) -> Option<(bool, u32)> {
+        let var = self.reg.get(prop)?;
+        Some((self.search.value_of(var)?, self.search.level_of(var)?))
+    }
+
+    /// Whether `prop`'s current assignment is **proven** (set at or below the
+    /// givens' base level) or **hypothetical** (above it). Meaningful only for an
+    /// assigned proposition; an unassigned one reports `Hypothetical`.
+    #[must_use]
+    pub fn certainty(&self, prop: &V) -> Certainty {
+        let proven = self
+            .assigned(prop)
+            .is_some_and(|(_, level)| level <= self.base_level());
+        if proven {
+            Certainty::Proven
+        } else {
+            Certainty::Hypothetical
+        }
+    }
+
+    /// The propositions the last event touches: a decision/propagation target, or
+    /// the propositions of a conflict clause. Empty for the other events. A view
+    /// maps these onto its own coordinates (and de-duplicates) to highlight them.
+    #[must_use]
+    pub fn touched_props(&self) -> Vec<V> {
+        match &self.last {
+            Some(Event::Decide { lit } | Event::Propagate { lit, .. }) => {
+                self.decode(*lit).into_iter().map(|(v, _)| v).collect()
+            }
+            Some(Event::Conflict { clause }) => self
+                .search
+                .clause_lits(*clause)
+                .iter()
+                .filter_map(|&lit| self.decode(lit).map(|(v, _)| v))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// On UNSAT, the propositions the core names (plan §4's core→givens); empty
+    /// otherwise.
+    #[must_use]
+    pub fn core_props(&self) -> Vec<V> {
+        match &self.last {
+            Some(Event::Unsat { core }) => core
+                .iter()
+                .filter_map(|&lit| self.decode(lit).map(|(v, _)| v))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Decode a literal to its proposition and polarity, or `None` for an
+    /// auxiliary variable that names no proposition. A positive literal decodes to
+    /// `(v, true)` ("v holds"), a negative one to `(v, false)` ("v is ruled out").
+    #[must_use]
+    pub fn decode(&self, lit: Lit) -> Option<(V, bool)> {
+        self.reg.decode(lit)
+    }
+}
+
+/// Sudoku-specific read model: the per-cell digits, candidates, and box
+/// confinement the 9×9 grid renders. Composed from the generic primitives above.
+impl Stepper<Cell> {
     /// The digit the search currently forces in cell `(r, c)`, if any.
     #[must_use]
     pub fn placed(&self, r: usize, c: usize) -> Option<u8> {
-        (1..=9u8).find(|&v| self.value(r, c, v) == Some(true))
+        (1..=9u8).find(|&v| self.value(&Cell { r, c, v }) == Some(true))
     }
 
     /// The digit forced in `(r, c)` together with whether that placement is a
@@ -109,7 +224,7 @@ impl Stepper {
     #[must_use]
     pub fn placement(&self, r: usize, c: usize) -> Option<(u8, Certainty)> {
         let v = self.placed(r, c)?;
-        Some((v, self.certainty(r, c, v)))
+        Some((v, self.certainty(&Cell { r, c, v })))
     }
 
     /// Values ruled out in `(r, c)` *only* under the current guess — hypothetical
@@ -118,24 +233,11 @@ impl Stepper {
     /// omitted: they are known non-facts, so the grid simply leaves them unmarked.
     #[must_use]
     pub fn hypo_eliminated(&self, r: usize, c: usize) -> [bool; 9] {
-        let base = self.search.base_level();
+        let base = self.base_level();
         std::array::from_fn(|i| {
             let v = u8::try_from(i + 1).expect("1..=9 fits in u8");
-            matches!(self.assigned(r, c, v), Some((false, level)) if level > base)
+            matches!(self.assigned(&Cell { r, c, v }), Some((false, level)) if level > base)
         })
-    }
-
-    /// Whether the current assignment of `Cell { r, c, v }` is proven (set at or
-    /// below the givens' base level) or hypothetical (set above it).
-    fn certainty(&self, r: usize, c: usize, v: u8) -> Certainty {
-        let proven = self
-            .assigned(r, c, v)
-            .is_some_and(|(_, level)| level <= self.search.base_level());
-        if proven {
-            Certainty::Proven
-        } else {
-            Certainty::Hypothetical
-        }
     }
 
     /// Per-value center-mark candidates for `(r, c)`: entry `v - 1` is `true` when
@@ -144,7 +246,7 @@ impl Stepper {
     pub fn candidates(&self, r: usize, c: usize) -> [bool; 9] {
         std::array::from_fn(|i| {
             let v = u8::try_from(i + 1).expect("1..=9 fits in u8");
-            self.value(r, c, v) != Some(false)
+            self.value(&Cell { r, c, v }) != Some(false)
         })
     }
 
@@ -162,103 +264,71 @@ impl Stepper {
         box_corner_marks(&box_candidates)[local]
     }
 
-    /// The current truth value of proposition `Cell { r, c, v }`.
-    fn value(&self, r: usize, c: usize, v: u8) -> Option<bool> {
-        self.reg
-            .get(&Cell { r, c, v })
-            .and_then(|var| self.search.value_of(var))
-    }
-
-    /// The truth value of `Cell { r, c, v }` and the decision level it was set
-    /// at, if assigned — the raw material for the proven/hypothetical split.
-    fn assigned(&self, r: usize, c: usize, v: u8) -> Option<(bool, u32)> {
-        let var = self.reg.get(&Cell { r, c, v })?;
-        Some((self.search.value_of(var)?, self.search.level_of(var)?))
-    }
-
-    /// The last event, decoded into a one-line status for the UI.
-    #[must_use]
-    pub fn description(&self) -> String {
-        let Some(event) = &self.last else {
-            return "Ready — press Step or Play to watch the solver.".to_owned();
-        };
-        match event {
-            Event::Decide { lit } => {
-                let (cell, holds) = self.decode(*lit);
-                let rel = if holds { "=" } else { "≠" };
-                format!("Guess: r{}c{} {rel} {}", cell.r + 1, cell.c + 1, cell.v)
-            }
-            Event::Propagate { lit, .. } => {
-                let (cell, holds) = self.decode(*lit);
-                if holds {
-                    format!("Forced: r{}c{} = {}", cell.r + 1, cell.c + 1, cell.v)
-                } else {
-                    format!("Ruled out {} at r{}c{}", cell.v, cell.r + 1, cell.c + 1)
-                }
-            }
-            Event::Conflict { .. } => "Conflict — analyzing and backtracking.".to_owned(),
-            Event::Backtrack { to_level } => format!("Backtrack to level {to_level}."),
-            Event::Learn { clause } => {
-                format!("Learned a clause ({} literals).", clause.len())
-            }
-            Event::Sat => "Solved by search!".to_owned(),
-            Event::Unsat { .. } => "Contradiction — these givens have no solution.".to_owned(),
-        }
-    }
-
     /// The cells the last event wants emphasized on the grid.
     #[must_use]
     pub fn emphasis(&self) -> Emphasis {
-        match &self.last {
-            Some(Event::Decide { lit } | Event::Propagate { lit, .. }) => {
-                let (cell, _) = self.decode(*lit);
-                Emphasis::Cells(vec![(cell.r, cell.c)])
-            }
-            Some(Event::Conflict { clause }) => {
-                let mut cells: Vec<(usize, usize)> = self
-                    .search
-                    .clause_lits(*clause)
-                    .iter()
-                    .map(|&lit| {
-                        let (cell, _) = self.decode(lit);
-                        (cell.r, cell.c)
-                    })
-                    .collect();
-                cells.sort_unstable();
-                cells.dedup();
-                Emphasis::Cells(cells)
-            }
-            _ => Emphasis::None,
+        let mut cells: Vec<(usize, usize)> = self
+            .touched_props()
+            .iter()
+            .map(|cell| (cell.r, cell.c))
+            .collect();
+        cells.sort_unstable();
+        cells.dedup();
+        if cells.is_empty() {
+            Emphasis::None
+        } else {
+            Emphasis::Cells(cells)
         }
     }
 
     /// On UNSAT, the given cells named by the core (plan §4's core→clues).
     #[must_use]
     pub fn core_cells(&self) -> Vec<(usize, usize)> {
-        match &self.last {
-            Some(Event::Unsat { core }) => {
-                let mut cells: Vec<(usize, usize)> = core
-                    .iter()
-                    .map(|&lit| {
-                        let (cell, _) = self.decode(lit);
-                        (cell.r, cell.c)
-                    })
-                    .collect();
-                cells.sort_unstable();
-                cells.dedup();
-                cells
+        let mut cells: Vec<(usize, usize)> = self
+            .core_props()
+            .iter()
+            .map(|cell| (cell.r, cell.c))
+            .collect();
+        cells.sort_unstable();
+        cells.dedup();
+        cells
+    }
+
+    /// The last event, decoded into a one-line status for the UI.
+    #[must_use]
+    pub fn description(&self) -> String {
+        let Some(event) = self.last_event() else {
+            return READY.to_owned();
+        };
+        if let Some(phase) = solver_phase(event) {
+            return phase;
+        }
+        match event {
+            Event::Decide { lit } => {
+                let (cell, holds) = self.cell_of(*lit);
+                let rel = if holds { "=" } else { "≠" };
+                format!("Guess: r{}c{} {rel} {}", cell.r + 1, cell.c + 1, cell.v)
             }
-            _ => Vec::new(),
+            Event::Propagate { lit, .. } => {
+                let (cell, holds) = self.cell_of(*lit);
+                if holds {
+                    format!("Forced: r{}c{} = {}", cell.r + 1, cell.c + 1, cell.v)
+                } else {
+                    format!("Ruled out {} at r{}c{}", cell.v, cell.r + 1, cell.c + 1)
+                }
+            }
+            Event::Sat => "Solved by search!".to_owned(),
+            Event::Unsat { .. } => "Contradiction — these givens have no solution.".to_owned(),
+            // Conflict/Backtrack/Learn are handled by `solver_phase` above.
+            _ => unreachable!("solver_phase covers the remaining events"),
         }
     }
 
-    /// Decode a literal to its Sudoku cell. Every rule/learned literal is a
-    /// `Cell` proposition (Sudoku's pairwise encoding mints no aux variables), so
-    /// this never fails in practice.
-    fn decode(&self, lit: Lit) -> (Cell, bool) {
-        self.reg
-            .decode(lit)
-            .expect("every literal decodes to a cell")
+    /// Decode a literal to its Sudoku cell. Every rule/learned literal is a `Cell`
+    /// proposition (Sudoku's pairwise encoding mints no aux variables), so this
+    /// never fails in practice.
+    fn cell_of(&self, lit: Lit) -> (Cell, bool) {
+        self.decode(lit).expect("every literal decodes to a cell")
     }
 }
 
@@ -294,7 +364,7 @@ mod tests {
         "534678912672195348198342567859761423426853791713924856961537284287419635345286179";
 
     /// Build the rule encoding and a stepper for `puzzle`.
-    fn stepper_for(puzzle: &Sudoku) -> Stepper {
+    fn stepper_for(puzzle: &Sudoku) -> Stepper<Cell> {
         let mut reg: Registry<Cell> = Registry::new();
         let mut cnf = Cnf::new();
         puzzle.encode_rules(&mut reg, &mut cnf);

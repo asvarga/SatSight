@@ -164,7 +164,7 @@ struct App {
     /// Givens + cells forced across every solution, or `None` until "Backbone".
     backbone: Option<Grid<SudokuCell>>,
     /// The live stepped search, or `None` until "Step"/"Play" is pressed.
-    stepper: Option<Stepper>,
+    stepper: Option<Stepper<Cell>>,
     /// Given cells named by an UNSAT core, to flag in red (plan §4).
     core: Vec<(usize, usize)>,
     /// Steps advanced per frame while playing.

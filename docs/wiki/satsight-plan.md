@@ -28,7 +28,9 @@ each decoding to a different puzzle-level meaning:
 | Backbone (true in every model)       | Facts holding across all solutions                                        |
 | UNSAT core over assumption literals  | Minimal contradictory subset of the user's clues                          |
 
-That table is essentially the reverse-mapping API. The demo's job is to make each row visible on the grid.
+That table is essentially the reverse-mapping API. The demo's job is to make each row visible on the
+grid — with one exception found in practice: the *learned-clauses* row was built and then removed,
+because for Sudoku those clauses are far too long to decode into a readable relationship (see §8).
 
 ---
 
@@ -180,15 +182,26 @@ artifact:
 - **Corner marks = possibility tier.** Candidates surviving BCP at the current node
   (`Cell{r,c,v}` not yet falsified). Cheap, always available, updates on every `Propagate`. This is
   the classic full-candidate-list convention.
-- **Center marks = discovered-relationship / proven-elimination tier.** Two feeds:
+- **Center marks = discovered-relationship / proven-elimination tier.** Two feeds were envisaged:
   - *Learned clauses*, filtered to short (binary/ternary), house-local clauses, decoded back through
     the registry (e.g. `¬Cell{A,3} ∨ ¬Cell{B,3}` → "A,B can't both be 3"). Hook: the `Learn` event.
   - *Failed-literal probing* — assume `Cell{r,c,v}=true`, run BCP, and if it conflicts, `v` is
     provably eliminated. Gives human-meaningful eliminations beyond naked singles.
 
-Honest caveat: raw CDCL learned clauses are noisy (long, path-dependent). Naively lighting center
-marks on every `Learn` will flicker with junk — hence the short/house-local filter, and prefer
-probing when the intent is *proven* eliminations rather than *discovered* relationships.
+**Post-implementation note (the learned-clause feed was dropped from the demo).** The honest caveat
+below turned out to be fatal in practice for Sudoku, not merely noisy. Measured over a full stepped
+solve of a hard puzzle, the hand-written CDCL learned 36 clauses whose *shortest* was 25 literals —
+so a "keep only ≤3-literal, readable" filter kept **nothing**, ever, on any realistic board. A
+25-literal disjunction isn't a relationship a human would learn from, so there was nothing worth
+surfacing even with a looser filter. The demo's learned-clause overlay (the side panel *and* the
+center-mark tint that read from it) was therefore removed as permanently-dead code. The `Learn`
+event is still narrated in the Step view ("Learned a clause (N literals)") — it just isn't decoded
+onto the grid. The probing feed (below) remains the sound route to *proven* eliminations.
+
+Honest caveat (why the above happened): raw CDCL learned clauses are noisy — long and
+path-dependent. For Sudoku's pairwise encoding they are consistently far longer than the
+binary/ternary a person could read, so lighting center marks from `Learn` surfaces junk or,
+after filtering, nothing at all. Prefer probing when the intent is *proven* eliminations.
 
 The two tiers aren't mutually exclusive per digit — a candidate can be alive in corner *and* flagged
 in center (part of a discovered pair, not yet eliminated), matching how people actually use the marks.
@@ -214,9 +227,9 @@ the decoded state into the two mark sets.
 - **Editing:** click a cell to enter/cycle a given; because givens are assumptions, an edit rebuilds
   the assumption vector and (optionally) re-solves incrementally. No re-encode.
 - **Overlays** (each toggleable): proven cells (level-0), tentative cells (trail, dimmed), corner
-  marks (BCP), center marks (probe + filtered learned), conflict flash, UNSAT-core highlight. A side
-  panel lists learned clauses decoded into puzzle terms (be honest most aren't human-meaningful;
-  filter to short ones).
+  marks (BCP), center marks (probe-proven), conflict flash, UNSAT-core highlight. (A side panel
+  listing learned clauses decoded into puzzle terms was planned and built, then removed — for Sudoku
+  the clauses are far too long to read; see §8's post-implementation note.)
 
 ---
 
@@ -227,8 +240,8 @@ the decoded state into the two mark sets.
 2. Hand-written CDCL with `step()`/`Event`; same puzzles solve; **verify against BatSat**.
 3. Givens-as-assumptions + UNSAT-core extraction + core→clues highlight.
 4. egui grid; editing; single-step + speed slider; level-0 "proven" overlay.
-5. Candidate lattice + `probe`; corner + center marks; learned-clause and conflict overlays; second
-   puzzle to validate the trait.
+5. Candidate lattice + `probe`; corner + center marks; conflict overlay; second puzzle to validate
+   the trait. (The learned-clause overlay was built here, then removed — see §8's note.)
 6. WASM build via trunk; polish.
 
 **Decide early (ripples widely):** adopt rustsat's `Lit`/`Cnf` types wholesale (recommended: yes);

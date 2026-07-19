@@ -36,8 +36,6 @@ use satsight_puzzles::{deduce, Grid, Puzzle};
 
 use stepper::{Certainty, Emphasis, Stepper};
 
-/// The tint on a center mark caught in a learned relationship (plan §8).
-const LEARNED_MARK_COLOR: egui::Color32 = egui::Color32::from_rgb(210, 150, 90);
 /// Corner marks: digits propagation has confined to a few cells of a 3×3 box.
 const CORNER_MARK_COLOR: egui::Color32 = egui::Color32::from_rgb(168, 130, 224);
 
@@ -433,10 +431,9 @@ impl App {
                         color,
                     );
                 } else if self.overlay == Overlay::Step {
-                    // No value yet: show the surviving candidates as center marks
-                    // (tinting those caught in a learned relationship), plus corner
-                    // marks for any digit propagation has confined to a few cells
-                    // of the box.
+                    // No value yet: show the surviving candidates as center marks,
+                    // plus corner marks for any digit propagation has confined to a
+                    // few cells of the box.
                     if let Some(st) = &self.stepper {
                         draw_candidates(
                             &painter,
@@ -444,11 +441,9 @@ impl App {
                             cell,
                             &CandidateMarks {
                                 candidates: st.candidates(r, c),
-                                learned: st.learned_marks(r, c),
                                 corner: st.corner_marks(r, c),
                                 guess_eliminated: st.hypo_eliminated(r, c),
                                 color: candidate_color,
-                                learned_color: LEARNED_MARK_COLOR,
                                 corner_color: CORNER_MARK_COLOR,
                                 guess_color,
                             },
@@ -537,7 +532,6 @@ impl App {
                 if self.overlay == Overlay::Step {
                     color_key(ui, search.gamma_multiply(0.5), "guess (hypothetical)");
                     color_key(ui, CORNER_MARK_COLOR, "corner mark (box-confined)");
-                    color_key(ui, LEARNED_MARK_COLOR, "learned relationship");
                 }
             });
             ui.add_space(2.0);
@@ -550,38 +544,6 @@ impl App {
             ui.label(line);
             ui.add_space(4.0);
         });
-    }
-
-    /// While stepping, a right-hand panel listing the short learned clauses
-    /// decoded to puzzle terms (plan §9). Most CDCL clauses are noisy, so the
-    /// stepper keeps only the readable ones.
-    fn draw_learned_panel(&self, ctx: &egui::Context) {
-        if self.overlay != Overlay::Step {
-            return;
-        }
-        let learned = self
-            .stepper
-            .as_ref()
-            .map(Stepper::learned_relationships)
-            .unwrap_or_default();
-        egui::SidePanel::right("learned")
-            .resizable(false)
-            .default_width(212.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.heading("Learned");
-                ui.label("Short clauses the solver discovered, in the puzzle's language:");
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if learned.is_empty() {
-                        ui.weak("(none yet — these appear when the search backtracks)");
-                    } else {
-                        for line in learned.iter().rev() {
-                            ui.monospace(line);
-                        }
-                    }
-                });
-            });
     }
 
     /// A floating "About / legend" window explaining the bidirectional reduction
@@ -631,7 +593,7 @@ fn help_thesis(ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.label(
         "Backward (interpreting): whatever the solver finds \u{2014} forced cells, \
-         surviving candidates, learned relationships, the unsatisfiable core \u{2014} \
+         surviving candidates, box confinements, the unsatisfiable core \u{2014} \
          is decoded through that same registry and painted on the grid in the \
          puzzle's own language. That round trip is the \u{201c}bidirectional \
          reduction\u{201d} this demo is about.",
@@ -723,13 +685,6 @@ fn help_legend(ui: &mut egui::Ui) {
     );
     legend(
         ui,
-        LEARNED_MARK_COLOR,
-        "learned-relationship tint",
-        "a center mark caught in a short clause the solver just learned (see the \
-         Learned panel), e.g. \u{201c}these two cells can't both be 3.\u{201d}",
-    );
-    legend(
-        ui,
         CORNER_MARK_COLOR,
         "corner marks",
         "a digit propagation has confined to just a few cells of a 3\u{00d7}3 box \
@@ -755,20 +710,13 @@ fn help_legend(ui: &mut egui::Ui) {
     );
 }
 
-/// The editing keys and the Learned panel explanation, closing the help window.
+/// The editing keys, closing the help window.
 fn help_editing(ui: &mut egui::Ui) {
-    section(ui, "Editing & the Learned panel");
+    section(ui, "Editing");
     ui.label(
         "Click a cell, then type 1\u{2013}9 to set a given, Backspace or 0 to clear, \
          and the arrow keys to move. Any edit drops the cached results \u{2014} press \
          Deduce, Full solve, or Step again.",
-    );
-    ui.add_space(4.0);
-    ui.label(
-        "While stepping, the right-hand Learned panel lists the short clauses the \
-         search has discovered, decoded back into the puzzle's language (e.g. \
-         r1c2\u{2260}3 \u{2228} r4c2\u{2260}3). Long, path-dependent clauses are \
-         filtered out to keep it readable.",
     );
     ui.add_space(6.0);
 }
@@ -836,15 +784,12 @@ fn draw_grid_lines(
 struct CandidateMarks {
     /// Values still Boolean-possible in the cell (center marks).
     candidates: [bool; 9],
-    /// Center marks caught in a learned relationship (tinted).
-    learned: [bool; 9],
     /// Values propagation has confined to a few cells of the box (corner marks).
     corner: [bool; 9],
     /// Values the current guess rules out here — hypothetical eliminations, shown
     /// struck through so a contingent elimination reads apart from a proven one.
     guess_eliminated: [bool; 9],
     color: egui::Color32,
-    learned_color: egui::Color32,
     corner_color: egui::Color32,
     guess_color: egui::Color32,
 }
@@ -852,9 +797,8 @@ struct CandidateMarks {
 /// Draw a cell's pencil marks while the search runs (Step view): the surviving
 /// candidate digits laid out as a 3×3 of **center marks**, plus any **corner
 /// marks** — digits propagation has confined to a few cells of the 3×3 box,
-/// pinned to the cell's corners ("the 7 goes in one of these cells"). A center
-/// mark caught in a learned relationship is tinted; a digit promoted to a corner
-/// mark is drawn only in its corner, never twice.
+/// pinned to the cell's corners ("the 7 goes in one of these cells"). A digit
+/// promoted to a corner mark is drawn only in its corner, never twice.
 fn draw_candidates(painter: &egui::Painter, rect: egui::Rect, cell: f32, marks: &CandidateMarks) {
     // Center marks: the full candidate list as a positional 3×3, but only once
     // the search has meaningfully narrowed the cell — and never a digit promoted
@@ -869,17 +813,12 @@ fn draw_candidates(painter: &egui::Painter, rect: egui::Rect, cell: f32, marks: 
             if !alive || marks.corner[i] {
                 continue;
             }
-            let digit_color = if marks.learned[i] {
-                marks.learned_color
-            } else {
-                marks.color
-            };
             painter.text(
                 mark_pos(i),
                 egui::Align2::CENTER_CENTER,
                 (i + 1).to_string(),
                 egui::FontId::proportional(sub * 0.62),
-                digit_color,
+                marks.color,
             );
         }
         // Hypothetical eliminations: values the current guess (not the givens)
@@ -1001,7 +940,6 @@ impl eframe::App for App {
         });
 
         self.draw_status(ctx);
-        self.draw_learned_panel(ctx);
         self.draw_help(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {

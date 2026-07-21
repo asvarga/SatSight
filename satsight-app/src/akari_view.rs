@@ -109,6 +109,15 @@ impl AkariView {
         }
     }
 
+    /// Swap in a different board. Unlike an edit, the walls change, so the rule CNF
+    /// and both solver backends must be rebuilt from scratch — [`from_puzzle`] does
+    /// exactly that. The speed setting is carried across for continuity.
+    fn load(&mut self, puzzle: Akari) {
+        let speed = self.speed;
+        *self = Self::from_puzzle(puzzle);
+        self.speed = speed;
+    }
+
     /// Drop cached results after an edit and stop overlaying them. The rules never
     /// change (only lamp givens, which are assumptions), so the solvers stand.
     fn invalidate(&mut self) {
@@ -330,6 +339,24 @@ impl AkariView {
             if ui.button("Clear lamps").clicked() {
                 self.clear();
             }
+            ui.separator();
+            if ui
+                .button("Easy sample")
+                .on_hover_text("The 7\u{00d7}7 number-heavy board that pure logic solves outright.")
+                .clicked()
+            {
+                self.load(Akari::sample());
+            }
+            if ui
+                .button("Hard sample")
+                .on_hover_text(
+                    "A 10\u{00d7}10 board with few clues: logic fills part of it and stalls, \
+                     so the rest needs search (Full solve / Step).",
+                )
+                .clicked()
+            {
+                self.load(Akari::hard_sample());
+            }
         });
         ui.horizontal(|ui| {
             ui.label("Step the CDCL:");
@@ -388,10 +415,12 @@ impl AkariView {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
+                let ruled_out = ui.visuals().weak_text_color();
                 swatch(ui, LOGIC_COLOR, "logic-proven");
                 swatch(ui, FULL_COLOR, "full-solve");
                 swatch(ui, BACKBONE_COLOR, "backbone (all solutions)");
                 swatch(ui, LIT_COLOR, "lit");
+                x_swatch(ui, ruled_out, "ruled out (no lamp)");
                 swatch(ui, CORE_COLOR, "UNSAT core");
                 if self.overlay == Overlay::Step {
                     swatch(ui, SEARCH_COLOR, "search-proven");
@@ -473,13 +502,46 @@ impl AkariView {
         )
     }
 
+    /// The ✕ colour to draw at white cell `(r, c)` if it is proven to hold **no**
+    /// lamp under the current overlay — a user-marked empty, or a cell the logic map
+    /// / full solve / backbone / search has ruled out; `None` if it isn't ruled out.
+    /// These were invisible before (only *lamps* were drawn), which left the board
+    /// looking near-empty even after a deduction; drawing a ✕ for every ruled-out cell
+    /// shows how much a step actually decides. In Step, a merely hypothetical
+    /// elimination (contingent on a guess) reads faded, like a hypothetical lamp.
+    fn ruled_out_mark(
+        &self,
+        r: usize,
+        c: usize,
+        grid: Option<&Grid<AkariCell>>,
+        base: egui::Color32,
+    ) -> Option<egui::Color32> {
+        if self.overlay == Overlay::Step {
+            let st = self.stepper.as_ref()?;
+            if st.value(&Lamp { r, c }) != Some(false) {
+                return None;
+            }
+            return Some(match st.certainty(&Lamp { r, c }) {
+                Certainty::Proven => base,
+                Certainty::Hypothetical => base.gamma_multiply(0.5),
+            });
+        }
+        matches!(
+            grid.map(|g| g.get(r, c)),
+            Some(AkariCell::White {
+                lamp: Some(false),
+                ..
+            })
+        )
+        .then_some(base)
+    }
+
     /// Draw the board and handle clicks (cycling a clicked white cell's given).
     fn draw_board(&mut self, ui: &mut egui::Ui) {
         let visuals = ui.visuals();
         let white_bg = visuals.extreme_bg_color;
         let empty_mark = visuals.weak_text_color();
         let grid_stroke = egui::Stroke::new(1.0, visuals.weak_text_color());
-        let given_empty = self.overlay != Overlay::Step;
 
         let (rows, cols) = (self.puzzle.rows(), self.puzzle.cols());
         let span = rows.max(cols) as f32;
@@ -546,9 +608,10 @@ impl AkariView {
 
                 if let Some(color) = self.lamp_paint(r, c, grid) {
                     draw_lamp(&painter, rect, color);
-                } else if given_empty && self.puzzle.given(r, c) == Some(false) {
-                    // A cell the user marked definitely-empty: a small ✕.
-                    draw_empty_mark(&painter, rect, empty_mark);
+                } else if let Some(color) = self.ruled_out_mark(r, c, grid, empty_mark) {
+                    // A cell proven to hold no lamp — a user-marked empty, or one the
+                    // logic / solve / backbone / search ruled out: a small ✕.
+                    draw_empty_mark(&painter, rect, color);
                 }
 
                 // The amber outline for the cell the last Step event touched.
@@ -612,10 +675,11 @@ fn draw_lamp(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     painter.circle_filled(center, radius, color);
 }
 
-/// Draw a small ✕ marking a cell the user pinned as definitely empty.
+/// Draw a small ✕ marking a cell proven to hold no lamp — whether the user pinned
+/// it empty or a deduction / solve / search ruled it out.
 fn draw_empty_mark(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let center = rect.center();
-    let reach = rect.width().min(rect.height()) * 0.14;
+    let reach = rect.width().min(rect.height()) * 0.17;
     let stroke = egui::Stroke::new(1.5, color);
     painter.line_segment(
         [
@@ -637,6 +701,29 @@ fn draw_empty_mark(painter: &egui::Painter, rect: egui::Rect, color: egui::Color
 fn swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 2.0, color);
+    ui.label(label);
+}
+
+/// A small ✕ mark + label, matching the "ruled out" glyph drawn on the board.
+fn x_swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    let center = rect.center();
+    let reach = 4.0;
+    let stroke = egui::Stroke::new(1.5, color);
+    ui.painter().line_segment(
+        [
+            center - egui::vec2(reach, reach),
+            center + egui::vec2(reach, reach),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            center - egui::vec2(reach, -reach),
+            center + egui::vec2(reach, -reach),
+        ],
+        stroke,
+    );
     ui.label(label);
 }
 

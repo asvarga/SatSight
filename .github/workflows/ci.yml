@@ -44,3 +44,38 @@ jobs:
         run: nix flake check ./nix
       - name: Build the dev shell
         run: nix develop ./nix --command true
+
+  # Build the wasm demo (release profile) and publish it as an asset on a
+  # rolling "web-latest" release, so asvarga.github.io can pull the latest
+  # prebuilt bundle over a plain HTTPS download — no cross-repo credentials
+  # needed since this repo is public. See satsight-app/index.html for the
+  # public-url path this is built for (/site/satsight/ on that site).
+  deploy-demo:
+    name: Publish web demo
+    needs: [rust, nix]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Build the wasm demo (release)
+        run: |
+          nix develop ./nix --command bash -c \
+            "cd satsight-app && trunk build --release --public-url /site/satsight/"
+      - name: Package the build
+        run: tar -C satsight-app/dist -czf satsight-web.tar.gz .
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: web-latest
+          name: Latest web demo build
+          make_latest: false
+          prerelease: true
+          body: >
+            Automatically rebuilt from ${{ github.sha }} on every push to main.
+            Consumed by asvarga.github.io at /site/satsight/ — not meant to be
+            browsed as a release.
+          files: satsight-web.tar.gz

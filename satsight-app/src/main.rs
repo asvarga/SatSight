@@ -27,6 +27,7 @@
     clippy::cast_sign_loss
 )]
 
+mod akari_view;
 mod coloring_view;
 mod stepper;
 
@@ -35,6 +36,7 @@ use satsight_core::{clause, BatSatBackend, Cdcl, Cnf, Lit, Registry, SolveOutcom
 use satsight_puzzles::sudoku::{Cell, LogicReport, Sudoku, SudokuCell};
 use satsight_puzzles::{backbone, deduce, Grid, Puzzle};
 
+use akari_view::AkariView;
 use coloring_view::{ColoringView, BACKBONE_COLOR};
 use stepper::{Certainty, Emphasis, Stepper};
 
@@ -90,11 +92,14 @@ fn main() {
 }
 
 /// Which puzzle the demo is showing. Sudoku is the primary, rich view; graph
-/// coloring (plan §7) proves the same abstractions drive a non-grid puzzle.
+/// coloring (plan §7) proves the same abstractions drive a non-grid puzzle, and
+/// Akari (Light Up) proves they drive a *cardinality* puzzle — at-most-k / exactly-k
+/// numbered walls beyond exactly-one.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PuzzleKind {
     Sudoku,
     Coloring,
+    Akari,
 }
 
 /// Which decoded artifact the grid is currently painting over the givens.
@@ -135,6 +140,8 @@ struct App {
     kind: PuzzleKind,
     /// The second-puzzle view (graph coloring), driven by the same generic maps.
     coloring: ColoringView,
+    /// The cardinality-puzzle view (Akari / Light Up), same generic maps again.
+    akari: AkariView,
 
     puzzle: Sudoku,
     selected: Option<(usize, usize)>,
@@ -190,6 +197,7 @@ impl App {
         Self {
             kind: PuzzleKind::Sudoku,
             coloring: ColoringView::new(),
+            akari: AkariView::new(),
             puzzle: Sudoku::hard_sample(),
             selected: None,
             reg,
@@ -1161,6 +1169,7 @@ impl eframe::App for App {
                 ui.separator();
                 ui.selectable_value(&mut self.kind, PuzzleKind::Sudoku, "Sudoku");
                 ui.selectable_value(&mut self.kind, PuzzleKind::Coloring, "Graph coloring");
+                ui.selectable_value(&mut self.kind, PuzzleKind::Akari, "Akari");
                 ui.separator();
                 if ui.button("Help ?").clicked() {
                     self.show_help = !self.show_help;
@@ -1174,6 +1183,7 @@ impl eframe::App for App {
         match self.kind {
             PuzzleKind::Sudoku => self.update_sudoku(ctx),
             PuzzleKind::Coloring => self.coloring.ui(ctx),
+            PuzzleKind::Akari => self.akari.ui(ctx),
         }
     }
 }

@@ -69,9 +69,91 @@ pub fn exactly_one_sequential(lits: &[Lit], aux: &mut VarManager, cnf: &mut Cnf)
     at_most_one_sequential(lits, aux, cnf);
 }
 
+/// At-most-`k` via Sinz's sequential counter — the general-`k` ladder.
+///
+/// This is the cardinality constraint the plan's second puzzle (Akari) needs
+/// beyond exactly-one (plan §7): a numbered wall wants *exactly* `k` adjacent
+/// lamps. It generalizes [`at_most_one_sequential`] (the `k = 1` case) to a
+/// running counter, introducing `(n − 1)·k` auxiliary registers `sᵢⱼ` ("at least
+/// `j` of the first `i` literals are true") drawn from `aux`.
+///
+/// Degenerate bounds short-circuit: `k ≥ n` is vacuous (nothing emitted), and
+/// `k = 0` forbids every literal with a unit clause.
+pub fn at_most_k_sequential(lits: &[Lit], k: usize, aux: &mut VarManager, cnf: &mut Cnf) {
+    let n = lits.len();
+    if k >= n {
+        return; // at most n-of-n is always satisfiable
+    }
+    if k == 0 {
+        for &l in lits {
+            cnf.add_clause(clause([!l]));
+        }
+        return;
+    }
+
+    // Registers sᵢⱼ (1 ≤ i ≤ n−1, 1 ≤ j ≤ k): "at least j of x₁…xᵢ are true".
+    // Kept 1-indexed to mirror the literature; row 0 and column 0 stay unused.
+    let mut s = vec![vec![None; k + 1]; n];
+    for row in s.iter_mut().take(n).skip(1) {
+        for slot in row.iter_mut().take(k + 1).skip(1) {
+            *slot = Some(aux.fresh().pos_lit());
+        }
+    }
+    let x = |i: usize| lits[i - 1];
+    let reg = |i: usize, j: usize| s[i][j].expect("register (i, j) is in range");
+
+    // x₁ → s₁,₁, and s₁,ⱼ is false for j > 1 (only one literal seen so far).
+    cnf.add_clause(clause([!x(1), reg(1, 1)]));
+    for j in 2..=k {
+        cnf.add_clause(clause([!reg(1, j)]));
+    }
+    // The carry recurrence for each further literal xᵢ (up to the last register row).
+    for i in 2..n {
+        cnf.add_clause(clause([!x(i), reg(i, 1)])); // xᵢ → sᵢ,₁
+        cnf.add_clause(clause([!reg(i - 1, 1), reg(i, 1)])); // sᵢ₋₁,₁ → sᵢ,₁
+        for j in 2..=k {
+            // xᵢ ∧ sᵢ₋₁,ⱼ₋₁ → sᵢ,ⱼ  (this literal bumps the count)
+            cnf.add_clause(clause([!x(i), !reg(i - 1, j - 1), reg(i, j)]));
+            cnf.add_clause(clause([!reg(i - 1, j), reg(i, j)])); // sᵢ₋₁,ⱼ → sᵢ,ⱼ
+        }
+    }
+    // The bound: no literal may push the running count past k, i.e. xᵢ forbids
+    // "already k among the earlier ones".
+    for i in 2..=n {
+        cnf.add_clause(clause([!x(i), !reg(i - 1, k)]));
+    }
+}
+
+/// At-least-`k`: at least `k` of `lits` are true.
+///
+/// The dual of [`at_most_k_sequential`]: "at least `k` true" is "at most `n − k`
+/// false", so it counts the *negated* literals with the complementary bound.
+/// `k = 0` is vacuous; `k > n` is impossible and emits the empty clause (UNSAT).
+pub fn at_least_k_sequential(lits: &[Lit], k: usize, aux: &mut VarManager, cnf: &mut Cnf) {
+    let n = lits.len();
+    if k == 0 {
+        return; // at least zero is always satisfiable
+    }
+    if k > n {
+        cnf.add_clause(clause([])); // unsatisfiable: can't have more true than exist
+        return;
+    }
+    let negated: Vec<Lit> = lits.iter().map(|&l| !l).collect();
+    at_most_k_sequential(&negated, n - k, aux, cnf);
+}
+
+/// Exactly-`k` via at-least-`k` and at-most-`k` — the numbered-wall constraint.
+pub fn exactly_k_sequential(lits: &[Lit], k: usize, aux: &mut VarManager, cnf: &mut Cnf) {
+    at_least_k_sequential(lits, k, aux, cnf);
+    at_most_k_sequential(lits, k, aux, cnf);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{exactly_one_pairwise, exactly_one_sequential};
+    use super::{
+        at_least_k_sequential, at_most_k_sequential, exactly_k_sequential, exactly_one_pairwise,
+        exactly_one_sequential,
+    };
     use crate::backend_batsat::BatSatBackend;
     use crate::cnf::{Cnf, VarManager};
     use crate::registry::Registry;
@@ -138,5 +220,82 @@ mod tests {
             models(&cnf, 5),
             vec![vec![0], vec![1], vec![2], vec![3], vec![4]]
         );
+    }
+
+    /// Every subset of `0..n` whose size satisfies `keep`, each as a sorted vec of
+    /// indices, sorted overall — the brute-force oracle for a cardinality bound.
+    fn subsets(n: usize, keep: impl Fn(usize) -> bool) -> Vec<Vec<usize>> {
+        let mut out = Vec::new();
+        for mask in 0u32..(1 << n) {
+            let set: Vec<usize> = (0..n).filter(|&i| mask & (1 << i) != 0).collect();
+            if keep(set.len()) {
+                out.push(set);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Encode `build` over `n` fresh puzzle variables (auxiliaries above them) and
+    /// return every model restricted to those variables — for comparison against
+    /// the brute-force subset oracle.
+    fn cardinality_models(
+        n: usize,
+        build: impl Fn(&[super::Lit], &mut VarManager, &mut Cnf),
+    ) -> Vec<Vec<usize>> {
+        let mut reg: Registry<u32> = Registry::new();
+        let lits: Vec<_> = (0..u32::try_from(n).unwrap())
+            .map(|i| reg.var(i).pos_lit())
+            .collect();
+        let mut cnf = Cnf::new();
+        let mut aux = VarManager::starting_at(u32::try_from(reg.len()).unwrap());
+        build(&lits, &mut aux, &mut cnf);
+        models(&cnf, n)
+    }
+
+    #[test]
+    fn at_most_k_admits_exactly_the_small_subsets() {
+        // Over every (n, k) in a small grid, the sequential at-most-k must accept
+        // exactly the subsets of size ≤ k — no more (unsound) and no fewer
+        // (incomplete). This pins the counter's indexing against brute force.
+        for n in 0..=5 {
+            for k in 0..=n + 1 {
+                let got = cardinality_models(n, |lits, aux, cnf| {
+                    at_most_k_sequential(lits, k, aux, cnf);
+                });
+                assert_eq!(got, subsets(n, |size| size <= k), "at-most-{k} over {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn at_least_k_admits_exactly_the_large_subsets() {
+        for n in 0..=5 {
+            for k in 0..=n + 1 {
+                let got = cardinality_models(n, |lits, aux, cnf| {
+                    at_least_k_sequential(lits, k, aux, cnf);
+                });
+                assert_eq!(got, subsets(n, |size| size >= k), "at-least-{k} over {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn exactly_k_admits_exactly_the_k_subsets() {
+        for n in 0..=5 {
+            for k in 0..=n + 1 {
+                let got = cardinality_models(n, |lits, aux, cnf| {
+                    exactly_k_sequential(lits, k, aux, cnf);
+                });
+                assert_eq!(got, subsets(n, |size| size == k), "exactly-{k} over {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn at_most_one_is_the_k_equals_one_case() {
+        // The general counter at k = 1 must reproduce the dedicated at-most-one.
+        let got = cardinality_models(4, |lits, aux, cnf| at_most_k_sequential(lits, 1, aux, cnf));
+        assert_eq!(got, subsets(4, |size| size <= 1));
     }
 }

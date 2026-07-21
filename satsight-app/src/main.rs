@@ -268,12 +268,14 @@ impl App {
             self.status = String::from("Play (or Step) to a full solution first, then block it.");
             return;
         }
-        // Read the placed digits out before mutating self (ends the stepper borrow).
+        // Read the placed digits out before mutating self (ends the stepper borrow),
+        // projecting the finished search through the puzzle's own backward map.
         let placements: Vec<(usize, usize, u8)> = {
             let st = self.stepper.as_ref().expect("is_solved implies a stepper");
+            let grid = self.puzzle.project(&st.view());
             (0..9)
                 .flat_map(|r| (0..9).map(move |c| (r, c)))
-                .filter_map(|(r, c)| st.placed(r, c).map(|v| (r, c, v)))
+                .filter_map(|(r, c)| grid.get(r, c).value.map(|v| (r, c, v)))
                 .collect()
         };
         // The no-good: ¬(all these placements hold) = the OR of their negations.
@@ -428,8 +430,15 @@ impl App {
             .unwrap_or_default();
     }
 
-    /// The digit to show at `(r, c)` and where it came from, if any.
-    fn cell_content(&self, r: usize, c: usize) -> Option<(u8, Source)> {
+    /// The digit to show at `(r, c)` and where it came from, if any. In Step mode
+    /// the value comes from `step`, the current search projected through the
+    /// puzzle's backward map (built once per frame in [`draw_grid`](Self::draw_grid)).
+    fn cell_content(
+        &self,
+        r: usize,
+        c: usize,
+        step: Option<&Grid<SudokuCell>>,
+    ) -> Option<(u8, Source)> {
         if let Some(v) = self.puzzle.given(r, c) {
             return Some((v, Source::Given));
         }
@@ -450,18 +459,17 @@ impl App {
                 .as_ref()
                 .and_then(|g| g.get(r, c).value)
                 .map(|v| (v, Source::Backbone)),
-            Overlay::Step => {
-                self.stepper
-                    .as_ref()
-                    .and_then(|st| st.placement(r, c))
-                    .map(|(v, certainty)| {
-                        let source = match certainty {
-                            Certainty::Proven => Source::SearchProven,
-                            Certainty::Hypothetical => Source::SearchGuess,
-                        };
-                        (v, source)
-                    })
-            }
+            Overlay::Step => step.and_then(|g| {
+                let cell = g.get(r, c);
+                cell.value.map(|v| {
+                    // A proven placement is pen; a guess-contingent one is pencil.
+                    let source = match cell.certainty {
+                        Some(Certainty::Hypothetical) => Source::SearchGuess,
+                        _ => Source::SearchProven,
+                    };
+                    (v, source)
+                })
+            }),
         }
     }
 
@@ -538,6 +546,17 @@ impl App {
 
         painter.rect_filled(rect, 4.0, bg);
 
+        // Project the live search once per frame through the puzzle's backward map:
+        // the Step overlay reads its placements, certainty, and pencil marks from
+        // this grid, so all the mark-splitting lives in `project()`, not here.
+        let step_grid = (self.overlay == Overlay::Step)
+            .then(|| {
+                self.stepper
+                    .as_ref()
+                    .map(|st| self.puzzle.project(&st.view()))
+            })
+            .flatten();
+
         // Conflicting givens (UNSAT core), flagged in red.
         for &(r, c) in &self.core {
             painter.rect_filled(cell_rect(r, c), 0.0, core_color);
@@ -564,7 +583,7 @@ impl App {
 
         for r in 0..9 {
             for c in 0..9 {
-                if let Some((digit, source)) = self.cell_content(r, c) {
+                if let Some((digit, source)) = self.cell_content(r, c, step_grid.as_ref()) {
                     let color = match source {
                         Source::Given => given_color,
                         Source::Logic => logic_color,
@@ -580,25 +599,23 @@ impl App {
                         egui::FontId::proportional(cell * 0.58),
                         color,
                     );
-                } else if self.overlay == Overlay::Step {
+                } else if let Some(sc) = step_grid.as_ref().map(|g| g.get(r, c)) {
                     // No value yet: show the surviving candidates as center marks,
                     // plus corner marks for any digit propagation has confined to a
-                    // few cells of the box.
-                    if let Some(st) = &self.stepper {
-                        draw_candidates(
-                            &painter,
-                            cell_rect(r, c),
-                            cell,
-                            &CandidateMarks {
-                                candidates: st.candidates(r, c),
-                                corner: st.corner_marks(r, c),
-                                guess_eliminated: st.hypo_eliminated(r, c),
-                                color: candidate_color,
-                                corner_color: CORNER_MARK_COLOR,
-                                guess_color,
-                            },
-                        );
-                    }
+                    // few cells of the box — all decoded by `project()` (issue #2).
+                    draw_candidates(
+                        &painter,
+                        cell_rect(r, c),
+                        cell,
+                        &CandidateMarks {
+                            candidates: sc.candidates,
+                            corner: sc.corner,
+                            guess_eliminated: sc.guess_eliminated,
+                            color: candidate_color,
+                            corner_color: CORNER_MARK_COLOR,
+                            guess_color,
+                        },
+                    );
                 }
             }
         }

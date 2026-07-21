@@ -17,12 +17,18 @@
 use satsight_core::cnf::{Cnf, Lit};
 use satsight_core::encodings::exactly_one_pairwise;
 use satsight_core::registry::Registry;
-use satsight_core::view::SolverView;
+use satsight_core::view::{Certainty, SolverView};
 
 use crate::puzzle::{deduce, Deductions, Grid, Puzzle};
 
 /// Board side length.
 const N: usize = 9;
+
+/// A value confined by propagation to at most this many cells of a 3×3 box is
+/// surfaced as a corner mark — the footprint of a hidden pair/triple ("one of
+/// these cells"). Wider than that is no hint; a value pinned to a single cell is
+/// a hidden single, shown as a placement instead.
+const CORNER_MARK_MAX_CELLS: usize = 3;
 
 /// A Sudoku proposition: "cell `(r, c)` holds value `v`" (the reduction's
 /// vocabulary). `r`, `c` are `0..9`; `v` is `1..=9`.
@@ -34,12 +40,35 @@ pub struct Cell {
 }
 
 /// Per-cell display state produced by [`Sudoku::project`].
+///
+/// A completed-model projection (a full solve) fills only [`value`](Self::value)
+/// and [`given`](Self::given); the pencil-mark fields default to empty. A live
+/// stepped projection (over a [`SolverView::from_search`]) fills them all — the
+/// center/corner mark split derived here in the backward map rather than in the
+/// frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SudokuCell {
     /// The value determined for this cell (`1..=9`), if any.
     pub value: Option<u8>,
     /// Whether this cell is a user-supplied given.
     pub given: bool,
+    /// For a live stepped projection: whether [`value`](Self::value) is a
+    /// **proven** fact (entailed by the givens alone) or a **hypothetical** one
+    /// (contingent on a branching guess). `None` for a completed-model projection,
+    /// which draws no proven/hypothetical distinction.
+    pub certainty: Option<Certainty>,
+    /// Center marks: entry `v - 1` is `true` when value `v` is still
+    /// Boolean-possible here (a propagation survivor).
+    pub candidates: [bool; 9],
+    /// Corner marks: entry `v - 1` is `true` when value `v` is Boolean-confined
+    /// within this cell's 3×3 box to a small set of cells that includes this one —
+    /// the "the 7 goes in one of these cells" hint (a hidden pair/triple
+    /// footprint), distinct from the per-cell center marks.
+    pub corner: [bool; 9],
+    /// Values ruled out here *only* under the current guess — hypothetical
+    /// eliminations. Entry `v - 1` is `true` for such a value; proven eliminations
+    /// (forced by the givens) are omitted, so the grid simply leaves them unmarked.
+    pub guess_eliminated: [bool; 9],
 }
 
 /// A Sudoku instance: just its givens. The rules are universal and live in
@@ -217,19 +246,66 @@ impl Puzzle for Sudoku {
     }
 
     fn project(&self, view: &SolverView<Cell>) -> Grid<SudokuCell> {
+        // The candidate lattice (center marks) first, so box confinement — a whole-
+        // box property — can be computed over it. This is the "split the decoded
+        // state into the two mark sets" the backward map owns (plan §8), derived
+        // from the view's generic artifacts rather than in the frontend.
+        let candidates: [[[bool; 9]; N]; N] = std::array::from_fn(|r| {
+            std::array::from_fn(|c| {
+                std::array::from_fn(|i| {
+                    let v = u8::try_from(i + 1).expect("1..=9 fits in u8");
+                    view.is_candidate(&Cell { r, c, v })
+                })
+            })
+        });
+        let corner = corner_marks(&candidates);
+
         Grid::from_fn(N, N, |r, c| {
             let mut value = None;
+            let mut certainty = None;
             for v in 1..=9u8 {
                 if view.value(&Cell { r, c, v }) == Some(true) {
                     value = Some(v);
+                    certainty = Some(view.certainty(&Cell { r, c, v }));
                 }
             }
+            let guess_eliminated = std::array::from_fn(|i| {
+                let v = u8::try_from(i + 1).expect("1..=9 fits in u8");
+                view.eliminated_under_guess(&Cell { r, c, v })
+            });
             SudokuCell {
                 value,
                 given: self.givens[r][c].is_some(),
+                certainty,
+                candidates: candidates[r][c],
+                corner: corner[r][c],
+                guess_eliminated,
             }
         })
     }
+}
+
+/// The box-confinement corner marks for the whole board, from its candidate
+/// lattice: value `v` is a corner mark in every cell of a box that still admits it,
+/// provided the box admits it in `2..=CORNER_MARK_MAX_CELLS` cells — few enough to
+/// read as "`v` goes in one of these cells." (A value admitted in a single cell is
+/// a hidden single, shown as a placement instead; one spread across the box is no
+/// hint.) A completed board admits each value in exactly one cell per box, so it
+/// yields no corner marks at all.
+fn corner_marks(candidates: &[[[bool; 9]; N]; N]) -> [[[bool; 9]; N]; N] {
+    let mut marks = [[[false; 9]; N]; N];
+    for b in 0..N {
+        let cells: Vec<(usize, usize)> = Sudoku::box_cells(b).collect();
+        for v in 0..9 {
+            let count = cells.iter().filter(|&&(r, c)| candidates[r][c][v]).count();
+            if (2..=CORNER_MARK_MAX_CELLS).contains(&count) {
+                for &(r, c) in &cells {
+                    marks[r][c][v] = candidates[r][c][v];
+                }
+            }
+        }
+    }
+    marks
 }
 
 /// A human-readable summary of what pure logic proves about a board (see
@@ -315,6 +391,10 @@ impl Sudoku {
         Grid::from_fn(N, N, |r, c| SudokuCell {
             value: values[r][c],
             given: self.givens[r][c].is_some(),
+            certainty: None,
+            candidates: [false; 9],
+            corner: [false; 9],
+            guess_eliminated: [false; 9],
         })
     }
 }
@@ -346,12 +426,12 @@ pub fn render(grid: &Grid<SudokuCell>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{render, Cell, Sudoku, SudokuCell};
+    use super::{render, Cell, Sudoku, SudokuCell, N};
     use crate::puzzle::{backbone, deduce, solve, Grid, Puzzle};
-    use satsight_core::cdcl::Cdcl;
+    use satsight_core::cdcl::{Cdcl, Search};
     use satsight_core::registry::Registry;
     use satsight_core::solver::{SolveOutcome, Solver};
-    use satsight_core::view::SolverView;
+    use satsight_core::view::{Certainty, SolverView};
     use satsight_core::Cnf;
 
     const PUZZLE: &str =
@@ -600,5 +680,190 @@ mod tests {
         assert!(!puzzle.logic_report().satisfiable);
         // …and the full backend agrees it is unsolvable.
         assert!(solve(&puzzle).is_none());
+    }
+
+    // --- Projection over a *live* search (plan §8): the backward map splits the
+    // decoded search state into the center/corner mark sets, generically over the
+    // `SolverView::from_search` artifacts. These tests moved here from the app's
+    // frontend `Stepper` when the mark-splitting moved into `project` (issue #2).
+
+    /// A fresh stepped search over `puzzle`'s givens, plus its registry.
+    fn search_for(puzzle: &Sudoku) -> (Registry<Cell>, Search) {
+        let mut reg = Registry::new();
+        let mut cnf = Cnf::new();
+        puzzle.encode_rules(&mut reg, &mut cnf);
+        let assumptions = puzzle.assumptions(&reg);
+        let search = Cdcl::from_cnf(&cnf).search(&assumptions);
+        (reg, search)
+    }
+
+    /// Drive `search` to a terminal state (bounded, so a bug can't hang the suite).
+    fn run_to_done(search: &mut Search) {
+        let mut guard = 0;
+        while !search.is_done() {
+            search.step();
+            guard += 1;
+            assert!(guard < 1_000_000, "the search must terminate");
+        }
+    }
+
+    #[test]
+    fn projected_candidates_shrink_to_one_per_solved_cell() {
+        // Once the search completes, every cell is solved, so its candidate lattice
+        // (the center marks) has narrowed to exactly one surviving value.
+        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
+        let (reg, mut search) = search_for(&puzzle);
+        run_to_done(&mut search);
+        let grid = puzzle.project(&SolverView::from_search(&reg, &search));
+        for r in 0..9 {
+            for c in 0..9 {
+                let live = grid.get(r, c).candidates.iter().filter(|&&b| b).count();
+                assert_eq!(live, 1, "a solved cell keeps a single candidate");
+            }
+        }
+    }
+
+    #[test]
+    fn box_confinement_surfaces_as_corner_marks() {
+        // Within a box, a value admitted in exactly a few cells (2..=3) is a "one of
+        // these cells" hint on those cells; a value pinned to a single cell, or one
+        // spread across the box, is not. Test the box-confinement helper directly on
+        // a synthetic candidate lattice (only box 0 populated).
+        let mut cand = [[[false; 9]; N]; N];
+        let cells: Vec<(usize, usize)> = Sudoku::box_cells(0).collect();
+        // Value 7 (index 6): admitted in the first three box cells only.
+        for &(r, c) in &cells[0..3] {
+            cand[r][c][6] = true;
+        }
+        // Value 1 (index 0): pinned to a single box cell (a hidden single).
+        let (pr, pc) = cells[4];
+        cand[pr][pc][0] = true;
+        // Value 2 (index 1): admitted in every box cell (not confined).
+        for &(r, c) in &cells {
+            cand[r][c][1] = true;
+        }
+
+        let marks = super::corner_marks(&cand);
+        // Value 7 is confined to three cells → corner mark on exactly those.
+        for &(r, c) in &cells[0..3] {
+            assert!(marks[r][c][6], "confined value marks its cells");
+        }
+        for &(r, c) in &cells[3..] {
+            assert!(
+                !marks[r][c][6],
+                "cells outside the confinement stay unmarked"
+            );
+        }
+        // Value 1 sits in one cell (hidden single) and value 2 in all nine → no mark.
+        for &(r, c) in &cells {
+            assert!(!marks[r][c][0] && !marks[r][c][1]);
+        }
+    }
+
+    #[test]
+    fn corner_marks_appear_over_a_real_search() {
+        // On a real puzzle, propagation confines some value to a few cells of a box
+        // at some point — the corner-mark hint must fire on genuine solver state.
+        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
+        let (reg, mut search) = search_for(&puzzle);
+        let mut ever = false;
+        let mut guard = 0;
+        while !search.is_done() && !ever {
+            search.step();
+            let grid = puzzle.project(&SolverView::from_search(&reg, &search));
+            ever = grid
+                .cells()
+                .iter()
+                .any(|cell| cell.corner.iter().any(|&m| m));
+            guard += 1;
+            assert!(guard < 1_000_000, "the search must terminate");
+        }
+        assert!(
+            ever,
+            "a real search should surface at least one corner mark"
+        );
+    }
+
+    #[test]
+    fn a_solved_board_leaves_no_corner_marks() {
+        // Once solved, each value sits in exactly one cell of every box, so no box
+        // confinement remains to surface.
+        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
+        let (reg, mut search) = search_for(&puzzle);
+        run_to_done(&mut search);
+        let grid = puzzle.project(&SolverView::from_search(&reg, &search));
+        for cell in grid.cells() {
+            assert!(
+                cell.corner.iter().all(|&m| !m),
+                "a solved board leaves no box-confined corner marks"
+            );
+        }
+    }
+
+    #[test]
+    fn given_cells_project_as_proven_facts() {
+        // Givens enter the search as assumptions (base-level decisions), so they and
+        // their propagated consequences read as proven — never hypotheses — no matter
+        // how much branching the rest of the solve needs.
+        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
+        let (reg, mut search) = search_for(&puzzle);
+        run_to_done(&mut search);
+        let grid = puzzle.project(&SolverView::from_search(&reg, &search));
+        let bytes = PUZZLE.as_bytes();
+        for r in 0..9 {
+            for c in 0..9 {
+                if bytes[r * 9 + c] != b'.' {
+                    assert_eq!(
+                        grid.get(r, c).certainty,
+                        Some(Certainty::Proven),
+                        "given r{r}c{c} is a known fact"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_board_projection_is_all_hypothetical() {
+        // With no givens the base level is 0, so the first cell the search fills —
+        // and its knock-on eliminations — are contingent on that guess, not proven.
+        let puzzle = Sudoku::empty();
+        let (reg, mut search) = search_for(&puzzle);
+        // Step until some cell holds a value.
+        let placed = loop {
+            search.step();
+            let grid = puzzle.project(&SolverView::from_search(&reg, &search));
+            if let Some((r, c)) = (0..9)
+                .flat_map(|r| (0..9).map(move |c| (r, c)))
+                .find(|&(r, c)| grid.get(r, c).value.is_some())
+            {
+                break (r, c);
+            }
+            assert!(
+                !search.is_done(),
+                "the search fills a cell before finishing"
+            );
+        };
+        let (r, c) = placed;
+        let grid = puzzle.project(&SolverView::from_search(&reg, &search));
+        assert_eq!(
+            grid.get(r, c).certainty,
+            Some(Certainty::Hypothetical),
+            "with no givens, a placed cell is a hypothesis"
+        );
+        // The value the guess placed is ruled out (hypothetically) elsewhere in its
+        // row once propagation runs.
+        let v = grid.get(r, c).value.expect("the cell holds a value");
+        for _ in 0..40 {
+            search.step();
+        }
+        let grid = puzzle.project(&SolverView::from_search(&reg, &search));
+        let ruled_out_in_row = (0..9)
+            .filter(|&cc| cc != c)
+            .any(|cc| grid.get(r, cc).guess_eliminated[usize::from(v - 1)]);
+        assert!(
+            ruled_out_in_row,
+            "the guess contingently rules its value out along the row"
+        );
     }
 }

@@ -1,9 +1,9 @@
 //! The stepping controller — the bridge between the observable CDCL and a view.
 //!
 //! This is the frontend half of plan §6: it owns a [`Search`] and drives it one
-//! [`Event`] at a time, decoding each move back into the puzzle's own vocabulary
-//! through the [`Registry`] so the UI can render it. Kept deliberately egui-free
-//! so the decoding is unit-testable without a window.
+//! [`Event`] at a time, so the UI can advance the solver and read its evolving
+//! state. Kept deliberately egui-free so the driving is unit-testable without a
+//! window.
 //!
 //! It is **generic over the puzzle's proposition type** `V`, so one stepper drives
 //! Sudoku (`V = Cell`) and graph coloring (`V = VertexColor`) alike — the Step view
@@ -19,16 +19,26 @@
 //!   — the propositions the last event, or an UNSAT core, names, for a view to map
 //!   onto its own coordinates and highlight;
 //! - [`last_event`](Stepper::last_event) + [`solver_phase`] — the raw event and the
-//!   shared status text for the puzzle-agnostic moves (conflict/backtrack/learn).
+//!   shared status text for the puzzle-agnostic moves (conflict/backtrack/learn);
+//! - [`view`](Stepper::view) — a [`SolverView`] over the live search, so a
+//!   [`Puzzle::project`](satsight_puzzles::Puzzle::project) decodes the mid-search
+//!   state (candidate lattice, center/corner marks, proven/hypothetical split) in
+//!   the puzzle's own vocabulary. The per-cell mark-splitting lives *there*, in the
+//!   backward map, not here in the frontend (issue #2).
 //!
-//! Each puzzle view composes these into its domain shapes: Sudoku's per-cell
-//! candidate digits and box-confinement corner marks live in the [`Stepper<Cell>`]
-//! impl below; graph coloring's per-vertex color pips live in the coloring view.
+//! What remains puzzle-shaped in this file is only event *narration* — turning the
+//! last [`Event`] into a one-line status and the cells to emphasize — which is
+//! inherently frontend and differs per puzzle's vocabulary.
 
 use std::hash::Hash;
 
-use satsight_core::{Cdcl, Event, Lit, Registry, Search};
+use satsight_core::{Cdcl, Event, Lit, Registry, Search, SolverView};
 use satsight_puzzles::sudoku::Cell;
+
+/// Whether a mid-search fact is entailed by the givens alone or is contingent on a
+/// search assumption — the distinction the grid draws differently (plan §1). Now
+/// defined by the core read model; re-exported so the views keep one name for it.
+pub use satsight_core::Certainty;
 
 /// Which cells the last event wants the Sudoku renderer to emphasize.
 pub enum Emphasis {
@@ -38,26 +48,8 @@ pub enum Emphasis {
     Cells(Vec<(usize, usize)>),
 }
 
-/// Whether a mid-search fact is entailed by the givens alone or is contingent on
-/// a search assumption — the distinction the grid draws differently (plan §1).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Certainty {
-    /// Forced by the givens (assumptions) via propagation: a **known** fact that
-    /// holds in every solution consistent with the clues.
-    Proven,
-    /// Placed or ruled out only under the current branching guess: a
-    /// **hypothetical** fact that may be undone on backtrack.
-    Hypothetical,
-}
-
 /// The status line shown before the first step — shared across puzzle views.
 pub const READY: &str = "Ready — press Step or Play to watch the solver.";
-
-/// A value confined by propagation to at most this many cells of a 3×3 box is
-/// surfaced as a corner mark — the footprint of a hidden pair/triple ("one of
-/// these cells"). Wider than that is no hint; a value pinned to a single cell is
-/// a hidden single, shown as a placement instead.
-const CORNER_MARK_MAX_CELLS: usize = 3;
 
 /// The status phrase for the puzzle-agnostic solver events (conflict, backtrack,
 /// learn); `None` for the events a view names in its own vocabulary (decide,
@@ -73,7 +65,7 @@ pub fn solver_phase(event: &Event) -> Option<String> {
     }
 }
 
-/// Drives a [`Search`] event-by-event and decodes its state for a puzzle view.
+/// Drives a [`Search`] event-by-event and hands its state to a puzzle view.
 ///
 /// Generic over the proposition type `V`: the search machinery is puzzle-agnostic
 /// (it works on [`Lit`]s and decodes through the [`Registry<V>`]), so a single
@@ -122,6 +114,16 @@ impl<V: Eq + Hash + Clone> Stepper<V> {
         matches!(self.last, Some(Event::Sat))
     }
 
+    /// A [`SolverView`] over the live search, for a
+    /// [`Puzzle::project`](satsight_puzzles::Puzzle::project) to decode the
+    /// mid-search state into the puzzle's own display grid — candidate lattice,
+    /// center/corner marks, and the proven/hypothetical split, all derived in the
+    /// backward map rather than here (issue #2).
+    #[must_use]
+    pub fn view(&self) -> SolverView<'_, V> {
+        SolverView::from_search(&self.reg, &self.search)
+    }
+
     /// The last event, for a view to name in its own vocabulary (the puzzle-neutral
     /// moves come pre-rendered from [`solver_phase`]).
     #[must_use]
@@ -154,17 +156,11 @@ impl<V: Eq + Hash + Clone> Stepper<V> {
 
     /// Whether `prop`'s current assignment is **proven** (set at or below the
     /// givens' base level) or **hypothetical** (above it). Meaningful only for an
-    /// assigned proposition; an unassigned one reports `Hypothetical`.
+    /// assigned proposition; an unassigned one reports `Hypothetical`. Delegates to
+    /// the core read model so the frontend and `project()` agree by construction.
     #[must_use]
     pub fn certainty(&self, prop: &V) -> Certainty {
-        let proven = self
-            .assigned(prop)
-            .is_some_and(|(_, level)| level <= self.base_level());
-        if proven {
-            Certainty::Proven
-        } else {
-            Certainty::Hypothetical
-        }
+        self.view().certainty(prop)
     }
 
     /// The propositions the last event touches: a decision/propagation target, or
@@ -208,62 +204,11 @@ impl<V: Eq + Hash + Clone> Stepper<V> {
     }
 }
 
-/// Sudoku-specific read model: the per-cell digits, candidates, and box
-/// confinement the 9×9 grid renders. Composed from the generic primitives above.
+/// Sudoku-specific event *narration*: the last move as a status line and the cells
+/// it wants emphasized. The per-cell display state (digits, candidates, corner
+/// marks) is no longer here — it is decoded generically by
+/// [`Sudoku::project`](satsight_puzzles::sudoku::Sudoku) over [`Stepper::view`].
 impl Stepper<Cell> {
-    /// The digit the search currently forces in cell `(r, c)`, if any.
-    #[must_use]
-    pub fn placed(&self, r: usize, c: usize) -> Option<u8> {
-        (1..=9u8).find(|&v| self.value(&Cell { r, c, v }) == Some(true))
-    }
-
-    /// The digit forced in `(r, c)` together with whether that placement is a
-    /// **proven** fact (entailed by the givens alone via propagation) or a
-    /// **hypothetical** one (contingent on a branching guess, undone on
-    /// backtrack) — the split the grid colours differently (plan §1).
-    #[must_use]
-    pub fn placement(&self, r: usize, c: usize) -> Option<(u8, Certainty)> {
-        let v = self.placed(r, c)?;
-        Some((v, self.certainty(&Cell { r, c, v })))
-    }
-
-    /// Values ruled out in `(r, c)` *only* under the current guess — hypothetical
-    /// eliminations, falsified above the givens' base level. Entry `v - 1` is
-    /// `true` for such a value. Proven eliminations (forced by the givens) are
-    /// omitted: they are known non-facts, so the grid simply leaves them unmarked.
-    #[must_use]
-    pub fn hypo_eliminated(&self, r: usize, c: usize) -> [bool; 9] {
-        let base = self.base_level();
-        std::array::from_fn(|i| {
-            let v = u8::try_from(i + 1).expect("1..=9 fits in u8");
-            matches!(self.assigned(&Cell { r, c, v }), Some((false, level)) if level > base)
-        })
-    }
-
-    /// Per-value center-mark candidates for `(r, c)`: entry `v - 1` is `true` when
-    /// value `v` is still Boolean-possible (not yet falsified).
-    #[must_use]
-    pub fn candidates(&self, r: usize, c: usize) -> [bool; 9] {
-        std::array::from_fn(|i| {
-            let v = u8::try_from(i + 1).expect("1..=9 fits in u8");
-            self.value(&Cell { r, c, v }) != Some(false)
-        })
-    }
-
-    /// Per-value corner marks for `(r, c)`: entry `v - 1` is `true` when value
-    /// `v` is Boolean-confined within this cell's 3×3 box to a small set of cells
-    /// that includes this one — the "the 7 goes in one of these cells in the box"
-    /// hint (a hidden pair/triple footprint), distinct from the per-cell center
-    /// marks.
-    #[must_use]
-    pub fn corner_marks(&self, r: usize, c: usize) -> [bool; 9] {
-        let (br, bc) = (r - r % 3, c - c % 3);
-        let box_candidates: [[bool; 9]; 9] =
-            std::array::from_fn(|i| self.candidates(br + i / 3, bc + i % 3));
-        let local = (r - br) * 3 + (c - bc);
-        box_corner_marks(&box_candidates)[local]
-    }
-
     /// The cells the last event wants emphasized on the grid.
     #[must_use]
     pub fn emphasis(&self) -> Emphasis {
@@ -332,28 +277,9 @@ impl Stepper<Cell> {
     }
 }
 
-/// From the per-cell candidate arrays of a 3×3 box (row-major, cell `i`'s entry
-/// `v` telling whether value `v + 1` is still possible there), the corner marks
-/// per box-cell: value `v` is a corner mark wherever it's still a candidate,
-/// provided the whole box admits it in `2..=CORNER_MARK_MAX_CELLS` cells — few
-/// enough to read as "`v` goes in one of these cells." (A value admitted in a
-/// single cell is a hidden single, shown as a placement instead.)
-fn box_corner_marks(box_candidates: &[[bool; 9]; 9]) -> [[bool; 9]; 9] {
-    let mut marks = [[false; 9]; 9];
-    for v in 0..9 {
-        let count = (0..9).filter(|&i| box_candidates[i][v]).count();
-        if (2..=CORNER_MARK_MAX_CELLS).contains(&count) {
-            for (i, cell) in marks.iter_mut().enumerate() {
-                cell[v] = box_candidates[i][v];
-            }
-        }
-    }
-    marks
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Certainty, Stepper};
+    use super::Stepper;
     use satsight_core::{clause, Assignment, Cdcl, Clause, Cnf, Registry, SolveOutcome};
     use satsight_puzzles::sudoku::{Cell, Sudoku};
     use satsight_puzzles::Puzzle;
@@ -403,11 +329,14 @@ mod tests {
             assert!(guard < 1_000_000, "the search must terminate");
         }
         assert_eq!(stepper.description(), "Solved by search!");
+        // The live search view projects to the unique solution through the puzzle's
+        // own backward map — the accessor the app renders from.
+        let grid = puzzle.project(&stepper.view());
         let sol = SOLUTION.as_bytes();
         for r in 0..9 {
             for c in 0..9 {
                 assert_eq!(
-                    stepper.placed(r, c),
+                    grid.get(r, c).value,
                     Some(sol[r * 9 + c] - b'0'),
                     "cell r{r}c{c} should match the unique solution"
                 );
@@ -416,145 +345,20 @@ mod tests {
     }
 
     #[test]
-    fn candidates_shrink_as_the_search_places_givens() {
+    fn stepper_view_agrees_with_a_direct_search_view() {
+        // `Stepper::view` must be exactly a `SolverView::from_search` over the
+        // stepper's own registry and search — the frontend read-model accessor.
         let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
         let mut stepper = stepper_for(&puzzle);
-        // Drive to completion, then every solved cell has exactly one candidate.
-        while !stepper.is_done() {
+        for _ in 0..200 {
             stepper.step();
         }
-        for r in 0..9 {
-            for c in 0..9 {
-                let live = stepper.candidates(r, c).iter().filter(|&&b| b).count();
-                assert_eq!(live, 1, "a solved cell keeps a single candidate");
-            }
+        let view = stepper.view();
+        // A handful of propositions must decode identically through the accessor.
+        for (r, c, v) in [(0, 0, 5), (0, 2, 4), (4, 4, 5), (8, 8, 9)] {
+            let cell = Cell { r, c, v };
+            assert_eq!(view.value(&cell), stepper.value(&cell));
         }
-    }
-
-    #[test]
-    fn box_confinement_surfaces_as_corner_marks() {
-        // A box where value 7 (index 6) is admitted in exactly three cells is a
-        // "one of these cells" hint on those three; a value spread across the
-        // whole box, or pinned to a single cell, is not.
-        let mut cand = [[true; 9]; 9];
-        for row in cand.iter_mut().skip(3) {
-            row[6] = false; // value 7 only in box-cells 0, 1, 2
-        }
-        for (i, row) in cand.iter_mut().enumerate() {
-            row[0] = i == 4; // value 1 pinned to a single box-cell (index 4)
-        }
-        let marks = super::box_corner_marks(&cand);
-        assert!(marks[0][6] && marks[1][6] && marks[2][6]);
-        assert!(marks.iter().skip(3).all(|cell| !cell[6]));
-        // Value 1 sits in one cell (hidden single) → no corner mark anywhere.
-        assert!(marks.iter().all(|cell| !cell[0]));
-        // Value 2 (index 1) is admitted everywhere (nine cells) → not confined.
-        assert!(marks.iter().all(|cell| !cell[1]));
-    }
-
-    #[test]
-    fn corner_marks_appear_over_a_real_search() {
-        // On a real puzzle, propagation confines some value to a few cells of a
-        // box at some point during the solve — the corner-mark hint must fire on
-        // genuine solver state, not just synthetic candidate arrays.
-        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
-        let mut stepper = stepper_for(&puzzle);
-        let mut ever = false;
-        while !stepper.is_done() {
-            stepper.step();
-            ever |= (0..9)
-                .flat_map(|r| (0..9).map(move |c| (r, c)))
-                .any(|(r, c)| stepper.corner_marks(r, c).iter().any(|&m| m));
-            if ever {
-                break;
-            }
-        }
-        assert!(
-            ever,
-            "a real search should surface at least one corner mark"
-        );
-    }
-
-    #[test]
-    fn a_solved_board_leaves_no_corner_marks() {
-        // Once solved, each value sits in exactly one cell of every box, so no
-        // box confinement remains to surface.
-        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
-        let mut stepper = stepper_for(&puzzle);
-        while !stepper.is_done() {
-            stepper.step();
-        }
-        for r in 0..9 {
-            for c in 0..9 {
-                assert!(
-                    stepper.corner_marks(r, c).iter().all(|&m| !m),
-                    "a solved board leaves no box-confined corner marks at r{r}c{c}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn given_cells_are_proven_facts() {
-        // Givens enter the search as assumptions (base-level decisions), so they
-        // and their propagated consequences read as proven — never hypotheses —
-        // no matter how much branching the rest of the solve needs.
-        let puzzle = Sudoku::from_ascii(PUZZLE).unwrap();
-        let mut stepper = stepper_for(&puzzle);
-        while !stepper.is_done() {
-            stepper.step();
-        }
-        let bytes = PUZZLE.as_bytes();
-        for r in 0..9 {
-            for c in 0..9 {
-                if bytes[r * 9 + c] != b'.' {
-                    assert_eq!(
-                        stepper.placement(r, c).map(|(_, cert)| cert),
-                        Some(Certainty::Proven),
-                        "given r{r}c{c} is a known fact"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn empty_board_search_is_all_hypothetical() {
-        // With no givens the base level is 0, so the first cell the search fills —
-        // and its knock-on eliminations — are contingent on that guess, not proven.
-        let mut stepper = stepper_for(&Sudoku::empty());
-        let placed = loop {
-            stepper.step();
-            if let Some(cell) = (0..9)
-                .flat_map(|r| (0..9).map(move |c| (r, c)))
-                .find(|&(r, c)| stepper.placed(r, c).is_some())
-            {
-                break cell;
-            }
-            assert!(
-                !stepper.is_done(),
-                "the search fills a cell before finishing"
-            );
-        };
-        let (r, c) = placed;
-        assert_eq!(
-            stepper.placement(r, c).map(|(_, cert)| cert),
-            Some(Certainty::Hypothetical),
-            "with no givens, a placed cell is a hypothesis"
-        );
-        // The value the guess placed is ruled out (hypothetically) elsewhere in
-        // its house once propagation runs.
-        let v = stepper.placed(r, c).expect("the cell holds a value");
-        for _ in 0..40 {
-            stepper.step();
-        }
-        let ruled_out_in_house = (0..9)
-            .filter(|&cc| cc != c)
-            .any(|cc| stepper.hypo_eliminated(r, cc)[usize::from(v - 1)]);
-        assert!(
-            ruled_out_in_house,
-            "the guess contingently rules its value out along the row"
-        );
     }
 
     #[test]

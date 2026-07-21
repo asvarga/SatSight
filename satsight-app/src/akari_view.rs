@@ -541,7 +541,7 @@ impl AkariView {
         let visuals = ui.visuals();
         let white_bg = visuals.extreme_bg_color;
         let empty_mark = visuals.weak_text_color();
-        let grid_stroke = egui::Stroke::new(1.0, visuals.weak_text_color());
+        let grid_stroke = egui::Stroke::new(1.0_f32, visuals.weak_text_color());
 
         let (rows, cols) = (self.puzzle.rows(), self.puzzle.cols());
         let span = rows.max(cols) as f32;
@@ -616,7 +616,7 @@ impl AkariView {
 
                 // The amber outline for the cell the last Step event touched.
                 if emphasis.contains(&(r, c)) {
-                    painter.rect_stroke(rect, 0.0, egui::Stroke::new(2.5, EMPHASIS_COLOR));
+                    painter.rect_stroke(rect, 0.0, egui::Stroke::new(2.5_f32, EMPHASIS_COLOR));
                 }
             }
         }
@@ -680,7 +680,7 @@ fn draw_lamp(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
 fn draw_empty_mark(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let center = rect.center();
     let reach = rect.width().min(rect.height()) * 0.17;
-    let stroke = egui::Stroke::new(1.5, color);
+    let stroke = egui::Stroke::new(1.5_f32, color);
     painter.line_segment(
         [
             center - egui::vec2(reach, reach),
@@ -709,7 +709,7 @@ fn x_swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
     let center = rect.center();
     let reach = 4.0;
-    let stroke = egui::Stroke::new(1.5, color);
+    let stroke = egui::Stroke::new(1.5_f32, color);
     ui.painter().line_segment(
         [
             center - egui::vec2(reach, reach),

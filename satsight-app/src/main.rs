@@ -737,12 +737,20 @@ impl App {
     fn draw_help(&mut self, ctx: &egui::Context) {
         // The window borrows its own open flag, so copy it out and store it back.
         let mut open = self.show_help;
+        // Open into the central area, below the top control bars, so the window's
+        // default first-launch position never covers the puzzle's buttons. This
+        // is only the *default* position — the user can drag it anywhere after.
+        // `draw_help` runs after the active view lays out its panels, so
+        // `available_rect` is the grid region left between the top bars and the
+        // bottom status bar.
+        let corner = ctx.available_rect().min + egui::vec2(8.0, 8.0);
         egui::Window::new("About SatSight — the bidirectional reduction")
             .open(&mut open)
             .collapsible(true)
             .resizable(true)
             .default_width(460.0)
             .default_height(560.0)
+            .default_pos(corner)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, help_body);
             });
@@ -1178,13 +1186,15 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
 
-        self.draw_help(ctx);
-
         match self.kind {
             PuzzleKind::Sudoku => self.update_sudoku(ctx),
             PuzzleKind::Coloring => self.coloring.ui(ctx),
             PuzzleKind::Akari => self.akari.ui(ctx),
         }
+
+        // Draw the help window last so its default position can be measured
+        // against the central grid region the active view leaves free.
+        self.draw_help(ctx);
     }
 }
 

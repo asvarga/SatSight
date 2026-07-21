@@ -249,19 +249,22 @@ impl AkariView {
             return phase;
         }
         match event {
-            Event::Decide { lit } => {
-                let (lamp, holds) = st.decode(*lit).expect("an Akari literal decodes");
-                let what = if holds { "a lamp at" } else { "no lamp at" };
-                format!("Guess: {what} ({}, {})", lamp.r, lamp.c)
-            }
-            Event::Propagate { lit, .. } => {
-                let (lamp, holds) = st.decode(*lit).expect("an Akari literal decodes");
-                if holds {
-                    format!("Forced: a lamp at ({}, {})", lamp.r, lamp.c)
-                } else {
-                    format!("Ruled out a lamp at ({}, {})", lamp.r, lamp.c)
+            // A decide/propagate literal may name an auxiliary variable of the
+            // cardinality (exactly-k) encoding rather than a lamp — those decode to
+            // `None`, and the search does branch and propagate on them, so report
+            // them as internal counter bookkeeping instead of unwrapping.
+            Event::Decide { lit } => match st.decode(*lit) {
+                Some((lamp, holds)) => {
+                    let what = if holds { "a lamp at" } else { "no lamp at" };
+                    format!("Guess: {what} ({}, {})", lamp.r, lamp.c)
                 }
-            }
+                None => "Guess on an internal wall-count variable.".to_owned(),
+            },
+            Event::Propagate { lit, .. } => match st.decode(*lit) {
+                Some((lamp, true)) => format!("Forced: a lamp at ({}, {})", lamp.r, lamp.c),
+                Some((lamp, false)) => format!("Ruled out a lamp at ({}, {})", lamp.r, lamp.c),
+                None => "Propagating an internal wall-count variable.".to_owned(),
+            },
             Event::Sat => "Every cell lit — a valid lighting, found by search!".to_owned(),
             Event::Unsat { .. } => "These givens contradict — no valid lighting exists.".to_owned(),
             // Conflict / Backtrack / Learn are handled by `solver_phase` above.
@@ -652,4 +655,38 @@ fn step_core_cells(st: &Stepper<Lamp>) -> Vec<(usize, usize)> {
     cells.sort_unstable();
     cells.dedup();
     cells
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AkariView;
+    use crate::stepper::Stepper;
+
+    #[test]
+    fn stepping_the_sample_never_panics_on_counter_variables() {
+        // Regression: the exactly-k wall encoding introduces auxiliary counter
+        // variables, and the CDCL both branches on and propagates them. Those name
+        // no lamp, so decoding them yields `None`; `step_status` must render that
+        // gracefully rather than unwrap and crash — the panic that killed the Akari
+        // Step view on the first click. Driving a full stepped solve exercises the
+        // same per-frame decode path the UI runs.
+        let mut view = AkariView::new();
+        view.start_stepper();
+        let mut guard = 0;
+        loop {
+            // Reads the last event exactly as the status bar does each frame.
+            let line = view.step_status();
+            assert!(!line.is_empty());
+            if view.stepper.as_ref().is_some_and(Stepper::is_done) {
+                break;
+            }
+            view.step_once();
+            guard += 1;
+            assert!(guard < 1_000_000, "the search must terminate");
+        }
+        assert!(
+            view.stepper.as_ref().is_some_and(Stepper::is_solved),
+            "the sample board is solvable, so the stepped search ends in a solution"
+        );
+    }
 }

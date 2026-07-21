@@ -44,4 +44,4 @@ pub use cnf::{clause, var_count, Clause, Cnf, Lit, Var, VarManager};
 pub use propagate::{Propagation, Propagator};
 pub use registry::Registry;
 pub use solver::{Assignment, SolveOutcome, Solver};
-pub use view::SolverView;
+pub use view::{Certainty, SolverView};

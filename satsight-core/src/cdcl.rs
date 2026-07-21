@@ -279,6 +279,60 @@ impl Search {
         cref >= self.n_rules
     }
 
+    /// Read-only failed-literal probe over the **current** partial assignment:
+    /// would asserting `lit` now force an immediate BCP conflict?
+    ///
+    /// Does not mutate the search — it copies the current values, tentatively sets
+    /// `lit`, and runs unit propagation to a fixpoint. Because it starts from the
+    /// live trail (branching guesses included), a `true` result means `lit` is
+    /// refuted *given the current tentative state*, not necessarily in every
+    /// solution — the mid-search analogue of [`Propagator::probe`], which the
+    /// [`SolverView`](crate::view::SolverView) surfaces as its `probe` hook. An
+    /// already-assigned literal is refuted exactly when it disagrees with its
+    /// current value.
+    #[must_use]
+    pub fn probe(&self, lit: Lit) -> bool {
+        let mut values = self.value.clone();
+        let idx = lit.var().idx();
+        match values[idx] {
+            Some(v) => return v != lit.is_pos(),
+            None => values[idx] = Some(lit.is_pos()),
+        }
+        let mut worklist: Vec<ClauseRef> = self.occ[idx].clone();
+        while let Some(ci) = worklist.pop() {
+            let mut unit = None;
+            let mut unassigned = 0u32;
+            let mut satisfied = false;
+            for &l in &self.clauses[ci] {
+                match values[l.var().idx()] {
+                    Some(v) if v == l.is_pos() => {
+                        satisfied = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => {
+                        unassigned += 1;
+                        unit = Some(l);
+                    }
+                }
+            }
+            if satisfied {
+                continue;
+            }
+            match unit {
+                Some(u) if unassigned == 1 => {
+                    values[u.var().idx()] = Some(u.is_pos());
+                    worklist.extend(self.occ[u.var().idx()].iter().copied());
+                }
+                // Every literal false (unassigned == 0), or ≥2 unassigned: the
+                // latter cannot be a conflict, so only the former ends the probe.
+                _ if unassigned == 0 => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Whether the search has reached a terminal SAT/UNSAT state.
     #[must_use]
     pub fn is_done(&self) -> bool {
@@ -819,6 +873,30 @@ mod tests {
         // base level — a hypothesis.
         assert!(matches!(search.step(), Event::Decide { .. }));
         assert!(search.level_of(c).unwrap() > search.base_level());
+    }
+
+    #[test]
+    fn search_probe_matches_bcp_before_branching() {
+        // Before any branch (only assumptions on the trail), a mid-search probe
+        // must agree with the search-free `Propagator::probe`: both start from the
+        // givens alone. (¬a ∨ ¬b) with assumption a: probing b conflicts, a does not.
+        use crate::propagate::Propagator;
+        let (a, b) = (Var::new(0), Var::new(1));
+        let mut cnf = Cnf::new();
+        cnf.add_clause(clause([a.neg_lit(), b.neg_lit()]));
+        let cdcl = Cdcl::from_cnf(&cnf);
+        let mut search = cdcl.search(&[a.pos_lit()]);
+        // Step until the assumption `a` is placed but before any free-variable branch.
+        assert!(matches!(search.step(), Event::Decide { .. }));
+        let prop = Propagator::from_cnf(&cnf);
+        assert_eq!(
+            search.probe(b.pos_lit()),
+            prop.probe(&[a.pos_lit()], b.pos_lit())
+        );
+        assert!(search.probe(b.pos_lit()), "b is refuted given a");
+        // An already-true literal never conflicts; its negation always does.
+        assert!(!search.probe(a.pos_lit()));
+        assert!(search.probe(a.neg_lit()));
     }
 
     #[test]

@@ -542,11 +542,11 @@ impl ColoringView {
                 // under the current guess (hypothetical), drawn faded.
                 Some((c, Certainty::Proven)) => (
                     PALETTE[c % PALETTE.len()],
-                    egui::Stroke::new(2.5, SEARCH_COLOR),
+                    egui::Stroke::new(2.5_f32, SEARCH_COLOR),
                 ),
                 Some((c, Certainty::Hypothetical)) => (
                     PALETTE[c % PALETTE.len()].gamma_multiply(0.5),
-                    egui::Stroke::new(2.5, SEARCH_COLOR.gamma_multiply(0.5)),
+                    egui::Stroke::new(2.5_f32, SEARCH_COLOR.gamma_multiply(0.5)),
                 ),
                 // Undecided: hollow, with candidate-color pips drawn separately.
                 None => (theme.hollow, theme.free_ring),
@@ -559,7 +559,7 @@ impl ColoringView {
                 Overlay::Full => FULL_COLOR,
                 _ => LOGIC_COLOR,
             };
-            egui::Stroke::new(2.5, accent)
+            egui::Stroke::new(2.5_f32, accent)
         } else {
             theme.free_ring
         };
@@ -572,14 +572,14 @@ impl ColoringView {
     /// Draw the graph and handle clicks (cycling a clicked vertex's color).
     fn draw_graph(&mut self, ui: &mut egui::Ui) {
         let visuals = ui.visuals();
-        let edge_stroke = egui::Stroke::new(1.5, visuals.weak_text_color());
-        let core_stroke = egui::Stroke::new(2.5, CORE_COLOR);
+        let edge_stroke = egui::Stroke::new(1.5_f32, visuals.weak_text_color());
+        let core_stroke = egui::Stroke::new(2.5_f32, CORE_COLOR);
         let label_color = visuals.strong_text_color();
         // The faint accent for a struck candidate pip (a hypothetical elimination).
         let pip_weak = visuals.weak_text_color();
         let theme = GraphTheme {
-            given_ring: egui::Stroke::new(3.0, visuals.strong_text_color()),
-            free_ring: egui::Stroke::new(1.5, visuals.weak_text_color()),
+            given_ring: egui::Stroke::new(3.0_f32, visuals.strong_text_color()),
+            free_ring: egui::Stroke::new(1.5_f32, visuals.weak_text_color()),
             hollow: visuals.extreme_bg_color,
         };
 
@@ -640,7 +640,7 @@ impl ColoringView {
             if self.core.contains(&v) {
                 ring = core_stroke;
             } else if emphasis.contains(&v) {
-                ring = egui::Stroke::new(2.5, EMPHASIS_COLOR);
+                ring = egui::Stroke::new(2.5_f32, EMPHASIS_COLOR);
             }
             painter.circle_stroke(center, radius, ring);
             painter.text(
@@ -793,7 +793,7 @@ fn draw_color_pips(
         if sv.candidate[color] {
             painter.circle_filled(pos, dot_r, PALETTE[color % PALETTE.len()]);
         } else if sv.hypo_eliminated[color] {
-            let stroke = egui::Stroke::new(1.0, weak);
+            let stroke = egui::Stroke::new(1.0_f32, weak);
             painter.circle_stroke(pos, dot_r, stroke);
             let reach = dot_r * 0.9;
             painter.line_segment(

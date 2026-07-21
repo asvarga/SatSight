@@ -512,8 +512,8 @@ impl App {
         let sel_color = visuals.selection.bg_fill;
         let core_color = egui::Color32::from_rgb(200, 70, 70).gamma_multiply(0.30);
         let emphasis_color = egui::Color32::from_rgb(240, 190, 90);
-        let thin = egui::Stroke::new(1.0, visuals.weak_text_color());
-        let thick = egui::Stroke::new(2.5, visuals.strong_text_color());
+        let thin = egui::Stroke::new(1.0_f32, visuals.weak_text_color());
+        let thick = egui::Stroke::new(2.5_f32, visuals.strong_text_color());
 
         let side = ui
             .available_width()
@@ -543,7 +543,7 @@ impl App {
                         painter.rect_stroke(
                             cell_rect(r, c),
                             0.0,
-                            egui::Stroke::new(2.5, emphasis_color),
+                            egui::Stroke::new(2.5_f32, emphasis_color),
                         );
                     }
                 }
@@ -1070,7 +1070,7 @@ fn draw_candidates(painter: &egui::Painter, rect: egui::Rect, cell: f32, marks: 
             let reach = sub * 0.3;
             painter.line_segment(
                 [pos - egui::vec2(reach, 0.0), pos + egui::vec2(reach, 0.0)],
-                egui::Stroke::new(1.0, marks.guess_color),
+                egui::Stroke::new(1.0_f32, marks.guess_color),
             );
         }
     }
